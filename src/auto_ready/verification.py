@@ -23,7 +23,7 @@ from . import __version__
 from .models import Frame, Geometry, Identity, Rect
 from .native import SafetyError
 from .simulator import SimulatorWindow
-from .ui import MainWindow
+from .ui import MainWindow, close_and_wait
 from .verification_record import VerificationRecorder
 
 SIMULATOR_TITLE = "Auto Ready 模拟器"
@@ -247,13 +247,14 @@ class _ManagedMainWindow(MainWindow):
     ):
         self._close_peer = close_peer
         self._recorder = recorder
+        self._recorder_finalized = False
         super().__init__(**kwargs)
 
     def closeEvent(self, event: Any) -> None:
         self._close_peer()
-        try:
-            super().closeEvent(event)
-        finally:
+        super().closeEvent(event)
+        if event.isAccepted() and not self.worker.isRunning() and not self._recorder_finalized:
+            self._recorder_finalized = True
             self._recorder.record("shutdown_state", worker_running=self.worker.isRunning(),
                                   attempted=self.engine.snapshot().attempted)
             if hasattr(self.backend, "clear_latest_frame"):
@@ -403,12 +404,12 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         try:
             if window is not None:
-                window.close()
+                close_and_wait(window)
             if simulator is not None:
                 simulator.close()
         finally:
             try:
-                if recorder is not None:
+                if recorder is not None and (window is None or not window.worker.isRunning()):
                     recorder.close()
             finally:
                 if instance is not None:

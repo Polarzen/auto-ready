@@ -8,6 +8,7 @@ from collections.abc import Callable
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
+import pytest
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
 
@@ -15,6 +16,23 @@ from auto_ready.app import main
 from auto_ready.config import ConfigStore
 from auto_ready.models import Frame, Geometry, Identity, Mode, Rect, Region, Settings, State
 from auto_ready.ui import ImagePreview, MainWindow
+
+
+@pytest.fixture
+def close_main_windows(qtbot):
+    windows = []
+
+    def register(window):
+        qtbot.addWidget(window)
+        windows.append(window)
+        return window
+
+    yield register
+
+    for window in windows:
+        window.close()
+        qtbot.waitUntil(lambda window=window: not window.worker.isRunning(), timeout=5000)
+        qtbot.waitUntil(lambda window=window: window._closed, timeout=3000)
 
 
 class FakeBackend:
@@ -149,12 +167,14 @@ def test_image_preview_maps_letterboxed_drag_to_physical_pixels(qtbot) -> None:
                                abs(last[1] - first[1]) + 1)]
 
 
-def test_fake_backend_workflow_previews_and_starts_in_remind_mode(qtbot) -> None:
+def test_fake_backend_workflow_previews_and_starts_in_remind_mode(
+    qtbot, close_main_windows
+) -> None:
     backend = FakeBackend()
     input_adapter = FakeInput(backend.show_success)
     window = MainWindow(backend=backend, input_adapter=input_adapter, store=FakeStore(),
                         hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
-    qtbot.addWidget(window)
+    close_main_windows(window)
     window.show()
 
     qtbot.waitUntil(lambda: window.target_combo.count() == 2, timeout=3000)
@@ -244,11 +264,11 @@ def test_fake_backend_workflow_previews_and_starts_in_remind_mode(qtbot) -> None
     assert input_adapter.calls == [(112, 84)]
 
 
-def test_invalid_button_recollection_clears_old_engine_binding(qtbot) -> None:
+def test_invalid_button_recollection_clears_old_engine_binding(qtbot, close_main_windows) -> None:
     backend = FakeBackend()
     window = MainWindow(backend=backend, input_adapter=FakeInput(), store=FakeStore(),
                         hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
-    qtbot.addWidget(window)
+    close_main_windows(window)
     window.show()
 
     qtbot.waitUntil(lambda: window.target_combo.count() == 2, timeout=3000)
@@ -269,12 +289,12 @@ def test_invalid_button_recollection_clears_old_engine_binding(qtbot) -> None:
     assert window.engine.snapshot().state == State.DISARMED
 
 
-def test_hotkey_revokes_start_while_worker_is_inside_start(qtbot) -> None:
+def test_hotkey_revokes_start_while_worker_is_inside_start(qtbot, close_main_windows) -> None:
     backend = FakeBackend()
     input_adapter = FakeInput()
     window = MainWindow(backend=backend, input_adapter=input_adapter, store=FakeStore(),
                         hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
-    qtbot.addWidget(window)
+    close_main_windows(window)
     window.show()
     qtbot.waitUntil(lambda: window.target_combo.count() == 2, timeout=3000)
     window.target_combo.setCurrentIndex(1)
@@ -310,10 +330,10 @@ def test_startup_smoke_test_closes_without_input(qtbot) -> None:
     assert main(["--smoke-test"]) == 0
 
 
-def test_loading_config_never_selects_or_enables_a_target(qtbot) -> None:
+def test_loading_config_never_selects_or_enables_a_target(qtbot, close_main_windows) -> None:
     window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=FakeStore(),
                         hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
-    qtbot.addWidget(window)
+    close_main_windows(window)
     window.show()
 
     window.load_config()
@@ -325,7 +345,7 @@ def test_loading_config_never_selects_or_enables_a_target(qtbot) -> None:
 
 
 def test_legacy_f12_config_requires_explicit_migration_without_rewriting_file(
-    qtbot, tmp_path
+    qtbot, tmp_path, close_main_windows
 ) -> None:
     legacy_hotkey = " cTrL + aLt + f 12 "
     store = ConfigStore(tmp_path)
@@ -340,7 +360,7 @@ def test_legacy_f12_config_requires_explicit_migration_without_rewriting_file(
 
     window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
                         hotkey_factory=factory, notifier=lambda: None, capture_delay=0)
-    qtbot.addWidget(window)
+    close_main_windows(window)
     window.show()
     window.load_config()
     qtbot.waitUntil(lambda: not window._config_loading, timeout=3000)
@@ -361,7 +381,9 @@ def test_legacy_f12_config_requires_explicit_migration_without_rewriting_file(
     assert store.config_path.read_bytes() == original_config
 
 
-def test_custom_hotkey_value_is_preserved_exactly_on_config_load(qtbot, tmp_path) -> None:
+def test_custom_hotkey_value_is_preserved_exactly_on_config_load(
+    qtbot, tmp_path, close_main_windows
+) -> None:
     custom_hotkey = " ctrl + shift + f10 "
     store = ConfigStore(tmp_path)
     store.save(Settings(hotkey=custom_hotkey), Region(), None, None)
@@ -374,7 +396,7 @@ def test_custom_hotkey_value_is_preserved_exactly_on_config_load(qtbot, tmp_path
 
     window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
                         hotkey_factory=factory, notifier=lambda: None, capture_delay=0)
-    qtbot.addWidget(window)
+    close_main_windows(window)
     window.show()
     window.load_config()
     qtbot.waitUntil(lambda: not window._config_loading, timeout=3000)
@@ -385,7 +407,9 @@ def test_custom_hotkey_value_is_preserved_exactly_on_config_load(qtbot, tmp_path
     assert window._hotkey_available
 
 
-def test_hotkey_registration_conflict_disables_auto_without_fallback(qtbot) -> None:
+def test_hotkey_registration_conflict_disables_auto_without_fallback(
+    qtbot, close_main_windows
+) -> None:
     requested: list[str] = []
 
     class ConflictingHotkey(FakeHotkey):
@@ -403,7 +427,7 @@ def test_hotkey_registration_conflict_disables_auto_without_fallback(qtbot) -> N
 
     window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=FakeStore(),
                         hotkey_factory=factory, notifier=lambda: None, capture_delay=0)
-    qtbot.addWidget(window)
+    close_main_windows(window)
     window.show()
 
     assert requested == ["Ctrl+Alt+F11"]
@@ -413,12 +437,12 @@ def test_hotkey_registration_conflict_disables_auto_without_fallback(qtbot) -> N
     assert not window.start_button.isEnabled()
 
 
-def test_hotkey_text_change_revokes_a_queued_start(qtbot) -> None:
+def test_hotkey_text_change_revokes_a_queued_start(qtbot, close_main_windows) -> None:
     backend = FakeBackend()
     input_adapter = FakeInput()
     window = MainWindow(backend=backend, input_adapter=input_adapter, store=FakeStore(),
                         hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
-    qtbot.addWidget(window)
+    close_main_windows(window)
     window.show()
     qtbot.waitUntil(lambda: window.target_combo.count() == 2, timeout=3000)
     window.target_combo.setCurrentIndex(1)

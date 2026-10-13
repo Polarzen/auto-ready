@@ -12,9 +12,19 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PySide6.QtCore import QPoint, QRect, QRectF, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import (
+    QEventLoop,
+    QPoint,
+    QRect,
+    QRectF,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -370,12 +380,17 @@ class MainWindow(QMainWindow):
         self._hotkey_error = ""
         self._hotkey: Any = None
         self._closed = False
+        self._shutdown_started = False
+        self._shutdown_poll_timer: QTimer | None = None
         self._manual_pause_requested = False
 
         self.engine = Engine(self.backend, input_adapter, self._notifier)
         self.worker = _IOWorker(
             self.engine, self.backend, self.store, self._notifier,
             lambda: bool(self._hotkey is not None and self._hotkey.available),
+        )
+        self.worker.finished.connect(
+            self._worker_finished_for_close, Qt.ConnectionType.QueuedConnection
         )
         try:
             self.emergencyStop.connect(self._show_emergency_stop)
@@ -390,7 +405,7 @@ class MainWindow(QMainWindow):
             self.engine.close()
             self.worker.shutdown()
             if self.worker.isRunning():
-                self.worker.wait()
+                _process_gui_until_thread_stops(self.worker)
             if self._hotkey is not None:
                 self._hotkey.close()
                 self._hotkey = None
@@ -1139,10 +1154,18 @@ class MainWindow(QMainWindow):
                                       self._pending_import_request is None)
 
     def closeEvent(self, event: Any) -> None:
-        if self._closed:
-            event.accept()
+        if not self._shutdown_started:
+            self._begin_shutdown()
+        if self.worker.isRunning():
+            event.ignore()
+            self._ensure_shutdown_polling()
             return
-        self._closed = True
+        self._finish_close()
+        event.accept()
+
+    def _begin_shutdown(self) -> None:
+        self._shutdown_started = True
+        self.setEnabled(False)
         if hasattr(self, "_timer"):
             self._timer.stop()
         self.worker.invalidate_authorization()
@@ -1150,9 +1173,53 @@ class MainWindow(QMainWindow):
             self.engine.close()
         finally:
             self.worker.shutdown()
-            if self.worker.isRunning():
-                self.worker.wait()
             if self._hotkey is not None:
                 self._hotkey.close()
                 self._hotkey = None
-        event.accept()
+
+    def _ensure_shutdown_polling(self) -> None:
+        if self._shutdown_poll_timer is None:
+            self._shutdown_poll_timer = QTimer(self)
+            self._shutdown_poll_timer.setInterval(20)
+            self._shutdown_poll_timer.timeout.connect(self._worker_finished_for_close)
+        if not self._shutdown_poll_timer.isActive():
+            self._shutdown_poll_timer.start()
+
+    def _worker_finished_for_close(self) -> None:
+        if not self._shutdown_started:
+            return
+        if self.worker.isRunning():
+            self._ensure_shutdown_polling()
+            return
+        self.close()
+
+    def _finish_close(self) -> None:
+        self._closed = True
+        if self._shutdown_poll_timer is not None:
+            self._shutdown_poll_timer.stop()
+
+
+def _process_gui_until_thread_stops(thread: QThread) -> None:
+    """Keep GUI dispatch alive while joining a worker that may be waiting on it."""
+    app = QApplication.instance()
+    if app is None:
+        raise RuntimeError("Cannot safely join the UI worker without a Qt application")
+    while thread.isRunning():
+        app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents, 25)
+        time.sleep(0.001)
+
+
+def close_and_wait(window: MainWindow) -> None:
+    """Close a window and dispatch Qt events until its worker has actually exited."""
+    app = QApplication.instance()
+    if app is None:
+        raise RuntimeError("Cannot safely close the UI without a Qt application")
+    window.close()
+    while not window._closed:
+        app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents, 25)
+        if not window.worker.isRunning():
+            window.close()
+        if not window._closed:
+            time.sleep(0.001)
+    if window.worker.isRunning():
+        raise RuntimeError("UI close completed while the worker was still running")

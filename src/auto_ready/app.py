@@ -164,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
             QTimer.singleShot(0, shutdown)
 
         sys.excepthook = handle_uncaught_exception
-        from .ui import MainWindow
+        from .ui import MainWindow, close_and_wait
 
         if args.simulator:
             from .simulator import SimulatorWindow
@@ -205,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.excepthook = previous_excepthook
         try:
             if window is not None:
-                window.close()
+                close_and_wait(window)
                 logging.getLogger("auto_ready").info(
                     "shutdown worker_running=%s attempted=%s", window.worker.isRunning(),
                     window.engine.snapshot().attempted,
