@@ -11,6 +11,10 @@ v0.2.0 专用模拟器真实输入六格历史验收通过（源码版 A/B/C、�
 
 原 v0.2.0 ZIP 原样保存在本地 `artifacts/releases/0.2.0-original/`，SHA-256 仍为 `ba3dd6ff4f3d80c2265be3c8d845a066c908785bc6069d32523f7597ac126299`；此前解压验收目录和真实输入证据保留。新包身份及后续构建检查单独记录。
 
+最终检查：207 项 pytest、Ruff、pip check 均通过；0.2.1 EXE 的离屏 `--smoke-test` 退出 0，使用假后端和假输入，不证明真实输入行为。原输出 EXE 被占用导致首次打包在 COLLECT 阶段失败，随后复用已通过的检查和构建产物，在新目录完成打包；未关闭用户实例、重跑全量检查或发送真实输入。
+
+新程序为 `dist/0.2.1/auto-ready/auto-ready.exe`，修复包为 `dist/auto-ready-0.2.1-windows-x64.zip`：97,623,908 字节，SHA-256 `bc7d9bb1e0464eb38503cc7b87e4bd271d6df8daf74b5dddaa0ca60780ef86ce`，262 个文件均与交付目录一致。构建源码 `497e81a1ffc2013771e745df438581f84633375d`、dirty=false；EXE SHA-256 `7cd4ce58882acf003af4b1705efa702f32f8934bbe982d3bde1b6ac65d087aa5`。检查记录位于本地 `artifacts/timer-fix-0.2.1/verification.json`；新包真实输入未重验，旧版六格结论继续作为历史记录保留。
+
 ## v0.2.0 历史验证范围
 
 | 类别 | 当前结果与边界 |

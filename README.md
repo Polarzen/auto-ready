@@ -6,6 +6,8 @@ v0.2.1 修复了停止或再次启动失败后，旧轮次用时仍不断增加�
 
 ## 运行
 
+本次 v0.2.1 修复包为 `dist\auto-ready-0.2.1-windows-x64.zip`；本机已解压程序位于 `dist\0.2.1\auto-ready\auto-ready.exe`。旧版若仍在运行，请先正常关闭，再打开新版。下面的通用路径用于自行构建的输出。
+
 便携版：完整解压 `dist\auto-ready-windows-x64.zip`，双击解压目录中的
 `auto-ready\auto-ready.exe`，无需另装 Python。不要单独移动 EXE；须保留旁边的 `_internal` 目录。
 从项目目录运行已构建程序和模拟器：
