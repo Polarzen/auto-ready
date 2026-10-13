@@ -13,7 +13,7 @@
 | F11 实机注册 | 注册/释放通过；同键第二次注册因冲突被拒绝（WinError 1409）；未输入 |
 | 源码启动 | 普通、`--simulator`、默认受限入口均退出 0，未启用、仅提醒、attempted=false，线程已停止 |
 | 源码真实输入 A/B/C | **NOT_EXECUTED**；需用户现场逐轮手动授权 |
-| 新版便携包 | 待本轮源码审查提交后重建并在新中文/空格目录验收；旧包不计入新版结果 |
+| 新版便携包 | 重新构建成功；中文/空格目录解压后普通、模拟器、默认受限入口均通过，退出 0，零尝试，线程已停止 |
 | 便携包真实输入 A/B/C | **NOT_EXECUTED**；源码结果不能替代 EXE 验收 |
 | 真实游戏 | **未验证**；本轮未扩展适配 |
 
@@ -40,6 +40,20 @@ Qt 回执的会话关联是时间关联，终态之后到达的事件明确标�
 所有这些记录标为 `UNIT_FAKE_QT`，不能说明 Windows SendInput 或真实桌面表现。
 引擎独立单测另外覆盖平移、成功标志缺失及点击前竞态，矩阵结果保存在 JUnit 属性。
 
+便携包使用 Python 3.11.9 / PyInstaller 6.22.3，从干净源码提交
+`488321d3291859d218f701298c1ae72b6d569298` 构建，`source_dirty=false`。
+最终包只刷新交付文档和文档提交标识，应用及 DLL 内容不变，不重编译应用。
+包内 `build-info.json` 区分 `source_commit` 与 `documentation_commit`。
+最终 ZIP 精确字节数和 SHA-256 记录在本地 `artifacts/package-0.2.0.json`，
+同名 `.sha256` 可直接校验；摘要没有放入 ZIP 内，避免文件自包含哈希。
+
+解压运行时工作目录为 EXE 所在目录，清除了 PYTHONPATH、PYTHONHOME、VIRTUAL_ENV
+及 Qt 路径覆盖，PATH 仅为 Windows/System32 与 Windows；不依赖源码目录或虚拟环境。
+实际观察到普通/模拟器入口使用 WindowsInput 但未启用、仅提醒、attempted=false；
+受限入口使用 RefusingInput 且 allow_real_input=false。三种入口关闭后 worker_running=false，
+进程退出 0，无残留自身窗口。已检查 Qt qwindows/DLL、OpenCV、winsound、示例 F11、许可证，
+EXE manifest 为 PerMonitorV2/asInvoker。构建 smoke test 也通过，仅使用假后端。
+
 ## 当前本地证据与复现
 
 - `.venv\Scripts\python.exe -m pytest -q --junitxml=artifacts\pytest-results-0.2.0.xml`
@@ -54,7 +68,9 @@ Qt 回执的会话关联是时间关联，终态之后到达的事件明确标�
 每轮由用户手动选择模式和开始，不自动续轮。剩余动作是分别用源码版及最终解压 EXE
 执行该流程，再独立核对原生返回、窗口回执和生产引擎新截图判据。
 
-源码同步已获授权，仍须完成待提交内容检查和远端重新核对后普通推送；不上传二进制或发布 Release。
+源码提交 `488321d3291859d218f701298c1ae72b6d569298` 已普通推送，随后重新读取远端 main 确认 SHA 一致。
+提交前检查了 43 个源码/测试/文档/依赖及许可证文件，未发现密钥、令牌或个人路径；
+没有上传二进制、日志、模板或截图，也没有发布 Release。后续交付记录作为仅文档提交同步。
 全局路由配置保持原样；按本轮明确例外使用已注册角色，不覆盖模型参数。
 
 ---
