@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "settings": {
+    "threshold": 0.92,
+    "consecutive_frames": 3,
+    "stable_seconds": 0.45,
+    "max_frame_age": 0.35,
+    "poll_seconds": 0.15,
+    "position_tolerance": 3,
+    "round_timeout": 120.0,
+    "verification_timeout": 5.0,
+    "hotkey": "Ctrl+Alt+F11"
+  },
+  "region": {
+    "x": 0.0,
+    "y": 0.0,
+    "width": 1.0,
+    "height": 1.0
+  },
+  "button_template": null,
+  "success_template": null
+}

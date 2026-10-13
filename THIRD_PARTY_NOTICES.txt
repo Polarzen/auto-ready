@@ -1,0 +1,22 @@
+auto-ready local Windows build
+
+This application uses unmodified third-party binary libraries, loaded dynamically:
+
+* Python 3.11 (PSF license): https://www.python.org/downloads/source/
+* PySide6 / Shiboken6 / Qt 6.10.3 (LGPL-3.0 option for the modules used here):
+  https://code.qt.io/cgit/pyside/pyside-setup.git/?h=v6.10.3
+  https://download.qt.io/archive/qt/6.10/6.10.3/
+  https://doc.qt.io/qtforpython-6/licenses.html
+* OpenCV / opencv-python-headless: https://github.com/opencv/opencv-python
+  OpenCV license and third-party notices are bundled under licenses/OpenCV.
+* NumPy: https://numpy.org/doc/stable/license.html
+* PyInstaller bootloader: GPL with bootloader distribution exception.
+  https://pyinstaller.org/en/stable/license.html
+
+The onedir distribution keeps Qt/PySide DLLs separate. Users may replace those
+libraries with compatible modified builds; reverse engineering for debugging
+modifications to LGPL-covered components is not prohibited by this project.
+Source for the application and build recipe are delivered alongside this local build.
+Library authors retain their own copyrights and license terms. Dependency license
+texts available in the installed distributions are copied into the bundle.
+No license selection for unrelated future project distribution is implied here.
