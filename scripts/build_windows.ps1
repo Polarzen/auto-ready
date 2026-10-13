@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$Zip
+    [switch]$Zip,
+    [string]$OutputDirectory = "dist"
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,7 +30,12 @@ $readme = Join-Path $projectRoot "README.md"
 $exampleConfig = Join-Path $projectRoot "examples\config.json"
 $launcher = Join-Path $projectRoot "scripts\launch.py"
 $sourceRoot = Join-Path $projectRoot "src"
-$distRoot = Join-Path $projectRoot "dist"
+if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    throw "OutputDirectory must not be empty."
+}
+$distRoot = [System.IO.Path]::GetFullPath(
+    [System.IO.Path]::Combine($projectRoot, $OutputDirectory)
+)
 $workRoot = Join-Path $projectRoot "build\pyinstaller"
 $specRoot = Join-Path $projectRoot "build\spec"
 

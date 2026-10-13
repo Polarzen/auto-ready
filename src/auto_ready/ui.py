@@ -78,6 +78,7 @@ class _IOWorker(QThread):
         self._last_hotkey_availability: bool | None = None
         self._commands: queue.Queue[tuple[int, str, Any]] = queue.Queue(maxsize=4)
         self._results: deque[_WorkerResult] = deque(maxlen=8)
+        self._profile_result: _WorkerResult | None = None
         self._lock = threading.Lock()
         self._snapshot: Snapshot | None = None
         self._next_id = 0
@@ -114,6 +115,11 @@ class _IOWorker(QThread):
         with self._lock:
             results = list(self._results)
             self._results.clear()
+            # Drain generic noise first; request/revision guards make a profile
+            # completion safe to handle last if intervening results changed state.
+            if self._profile_result is not None:
+                results.append(self._profile_result)
+                self._profile_result = None
         return results
 
     def shutdown(self) -> None:
@@ -128,7 +134,10 @@ class _IOWorker(QThread):
 
     def _record_result(self, result: _WorkerResult) -> None:
         with self._lock:
-            self._results.append(result)
+            if result.action in {"load_config", "save_config", "save_config_as"}:
+                self._profile_result = result
+            else:
+                self._results.append(result)
 
     def _refresh_hotkey_availability(self) -> None:
         available = bool(self._hotkey_probe())
@@ -177,12 +186,22 @@ class _IOWorker(QThread):
                 raise RuntimeError("识别设置已更改，已取消排队中的开始操作")
             return revision, session_id
         if action == "save_config":
-            settings, region, button, success = payload
-            self._store.save(settings, region, button, success)
-            return "配置已保存"
+            path, revision, settings, region, button, success = payload
+            default_path = getattr(self._store, "config_path", None)
+            if path is None or (default_path is not None and Path(path) == Path(default_path)):
+                self._store.save(settings, region, button, success)
+            else:
+                self._store.save_to(Path(path), settings, region, button, success)
+            return Path(path) if path is not None else None, revision
+        if action == "save_config_as":
+            path, revision, settings, region, button, success = payload
+            profile_path = Path(path)
+            self._store.save_to(profile_path, settings, region, button, success)
+            return profile_path, revision
         if action == "load_config":
-            revision = payload
-            return revision, self._store.load()
+            path, revision = payload
+            config = self._store.load() if path is None else self._store.load_from(Path(path))
+            return revision, path, config
         if action == "import_template":
             path, geometry, identity, revision, template_kind = payload
             from .config import load_template
@@ -374,7 +393,11 @@ class MainWindow(QMainWindow):
         self._pending_start_request: int | None = None
         self._pending_capture_request: int | None = None
         self._pending_import_request: int | None = None
+        self._pending_profile_request: int | None = None
+        self._pending_profile_action: str | None = None
         self._config_loading = False
+        config_path = getattr(self.store, "config_path", None)
+        self._current_config_path = Path(config_path) if config_path is not None else None
         self._refreshing_targets = False
         self._hotkey_available = False
         self._hotkey_error = ""
@@ -534,16 +557,23 @@ class MainWindow(QMainWindow):
 
         config_box = QGroupBox("配置与提示音")
         config_layout = QVBoxLayout(config_box)
+        self.current_config_label = QLabel()
+        self.current_config_label.setWordWrap(True)
+        self._update_current_config_label()
         self.save_button = QPushButton("明确保存配置和模板")
         self.save_button.clicked.connect(self.save_config)
-        self.load_button = QPushButton("载入配置（不会选择窗口或开始）")
-        self.load_button.clicked.connect(self.load_config)
+        self.load_button = QPushButton("选择并载入配置…")
+        self.load_button.clicked.connect(self.choose_config_to_load)
+        self.save_as_button = QPushButton("另存为配置…")
+        self.save_as_button.clicked.connect(self.save_config_as)
         self.import_button = QPushButton("导入模板图片…")
         self.import_button.clicked.connect(self.import_template)
         self.sound_button = QPushButton("测试系统提示音")
         self.sound_button.clicked.connect(self.test_sound)
+        config_layout.addWidget(self.current_config_label)
         config_layout.addWidget(self.save_button)
         config_layout.addWidget(self.load_button)
+        config_layout.addWidget(self.save_as_button)
         config_layout.addWidget(self.import_button)
         config_layout.addWidget(self.sound_button)
         right.addWidget(config_box)
@@ -561,6 +591,46 @@ class MainWindow(QMainWindow):
         if label:
             self.status_label.setText(label)
         return request_id
+
+    def _update_current_config_label(self) -> None:
+        path = self._current_config_path
+        if path is None:
+            self.current_config_label.setText("当前配置：默认配置")
+            self.current_config_label.setToolTip("使用应用默认配置")
+            return
+        self.current_config_label.setText(f"当前配置：{path.name}")
+        self.current_config_label.setToolTip(str(path))
+
+    def _set_current_config_path(self, path: Path | None) -> None:
+        self._current_config_path = Path(path) if path is not None else None
+        self._update_current_config_label()
+
+    def _profile_action_in_progress(self) -> bool:
+        if self._pending_profile_request is None:
+            return False
+        self.status_label.setText("配置操作正在进行，请稍候。")
+        return True
+
+    def _import_action_in_progress(self) -> bool:
+        if self._pending_import_request is None:
+            return False
+        self.status_label.setText("模板导入中，请稍候。")
+        return True
+
+    def _queue_profile_action(self, action: str, payload: Any, label: str) -> None:
+        request_id = self._queue(action, payload, label)
+        if request_id is None:
+            if action == "load_config":
+                self._config_loading = False
+            self._update_controls()
+            return
+        self._pending_profile_request = request_id
+        self._pending_profile_action = action
+        self._update_controls()
+
+    def _stop_before_profile_dialog(self, reason: str) -> None:
+        self._invalidate_semantics()
+        self.engine.stop(reason)
 
     def _invalidate_semantics(self) -> None:
         self.worker.invalidate_authorization()
@@ -845,24 +915,87 @@ class MainWindow(QMainWindow):
         self.engine.stop("已手动停止")
 
     def save_config(self) -> None:
+        if self._profile_action_in_progress():
+            return
+        if self._import_action_in_progress():
+            return
         try:
             self.settings.validate()
             self.region.validate()
-            self._queue("save_config", (self.settings, self.region, self.button, self.success),
-                        "正在保存配置…")
+            self._queue_profile_action(
+                "save_config",
+                (self._current_config_path, self._semantic_revision, self.settings,
+                 self.region, self.button, self.success),
+                "正在保存当前配置…",
+            )
         except ValueError as exc:
             self.status_label.setText(f"配置无效：{exc}")
 
-    def load_config(self) -> None:
-        self._invalidate_semantics()
-        self.engine.stop("载入配置")
+    def save_config_as(self) -> None:
+        if self._profile_action_in_progress():
+            return
+        if self._import_action_in_progress():
+            return
+        self._stop_before_profile_dialog("另存为配置")
+        default_path = self._current_config_path or getattr(self.store, "config_path", None)
+        default_name = str(default_path) if default_path is not None else ""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "另存为配置", default_name, "JSON 配置 (*.json)"
+        )
+        if not path:
+            self.status_label.setText("已取消另存为；本轮保持停止。")
+            return
+        self._save_config_to_path(Path(path))
+
+    def _save_config_to_path(self, path: Path) -> None:
+        try:
+            self.settings.validate()
+            self.region.validate()
+            self._queue_profile_action(
+                "save_config_as",
+                (Path(path), self._semantic_revision, self.settings, self.region,
+                 self.button, self.success),
+                "正在保存配置快照…",
+            )
+        except ValueError as exc:
+            self.status_label.setText(f"配置无效：{exc}")
+
+    def choose_config_to_load(self) -> None:
+        if self._profile_action_in_progress():
+            return
+        if self._import_action_in_progress():
+            return
+        self._stop_before_profile_dialog("选择要载入的配置")
+        current_path = self._current_config_path or getattr(self.store, "config_path", None)
+        start_directory = str(current_path.parent) if current_path is not None else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择并载入配置", start_directory, "JSON 配置 (*.json)"
+        )
+        if not path:
+            self.status_label.setText("已取消载入配置选择；本轮保持停止。")
+            return
+        self._queue_config_load(Path(path))
+
+    def load_config(self, path: Path | None = None) -> None:
+        """Load the default configuration or an explicitly selected profile."""
+        if self._profile_action_in_progress():
+            return
+        if self._import_action_in_progress():
+            return
+        self._stop_before_profile_dialog("载入配置")
+        self._queue_config_load(path)
+
+    def _queue_config_load(self, path: Path | None) -> None:
         self._config_loading = True
         self._update_controls()
-        if self._queue("load_config", self._semantic_revision, "正在载入配置…") is None:
-            self._config_loading = False
-            self._update_controls()
+        self._queue_profile_action(
+            "load_config", (Path(path) if path is not None else None,
+                            self._semantic_revision), "正在载入配置…"
+        )
 
     def import_template(self) -> None:
+        if self._profile_action_in_progress():
+            return
         if self._pending_import_request is not None:
             self.status_label.setText("模板导入中，请稍候。")
             return
@@ -873,16 +1006,19 @@ class MainWindow(QMainWindow):
         if template_kind not in {"button", "success"}:
             self.status_label.setText("请先选择要导入的模板类型：按钮模板或成功标志。")
             return
+        self._stop_before_profile_dialog("导入模板")
         path, _ = QFileDialog.getOpenFileName(
             self, "导入模板图片", "", "PNG 图片 (*.png)"
         )
-        if path:
-            self._invalidate_semantics()
-            self.engine.stop("导入模板")
-            payload = (path, self.geometry, self.identity, self._semantic_revision)
-            self._pending_import_request = self._queue(
-                "import_template", (*payload, template_kind), "正在导入模板…"
-            )
+        if not path:
+            self.status_label.setText("已取消导入模板；本轮保持停止。")
+            self._update_controls()
+            return
+        payload = (path, self.geometry, self.identity, self._semantic_revision)
+        self._pending_import_request = self._queue(
+            "import_template", (*payload, template_kind), "正在导入模板…"
+        )
+        self._update_controls()
 
     def test_sound(self) -> None:
         self._queue("test_sound", label="正在测试系统提示音…")
@@ -901,7 +1037,7 @@ class MainWindow(QMainWindow):
         for widget in widgets:
             widget.blockSignals(False)
 
-    def _apply_loaded_config(self, value: Any) -> None:
+    def _apply_loaded_config(self, value: Any, path: Path | None) -> None:
         self._invalidate_semantics()
         self._config_loading = False
         settings, region, button, success = value
@@ -916,11 +1052,29 @@ class MainWindow(QMainWindow):
         # Loading never selects a target or starts a round. A target selected this launch
         # remains explicitly selected, but the loaded templates are only configured for it.
         self._configure_engine("配置已载入；请手动预览并开始")
+        if path is None:
+            default_path = getattr(self.store, "config_path", None)
+            self._set_current_config_path(
+                Path(default_path) if default_path is not None else None
+            )
+        else:
+            self._set_current_config_path(path)
         self.status_label.setText("配置已载入；本轮未启用，请检查模板后手动预览并开始。")
         self._update_controls()
 
     def _handle_result(self, result: _WorkerResult) -> None:
         if result.error:
+            if result.action in {"save_config", "save_config_as", "load_config"}:
+                if result.request_id != self._pending_profile_request:
+                    return
+                action = self._pending_profile_action
+                self._pending_profile_request = None
+                self._pending_profile_action = None
+                if action == "load_config":
+                    self._config_loading = False
+                self.status_label.setText(f"后台操作失败：{result.error}")
+                self._update_controls()
+                return
             if result.action == "capture" and result.request_id == self._pending_capture_request:
                 self._pending_capture_request = None
                 self._update_controls()
@@ -930,9 +1084,6 @@ class MainWindow(QMainWindow):
                 self._update_controls()
             if result.action == "refresh_targets":
                 self._refreshing_targets = False
-                self._update_controls()
-            if result.action == "load_config":
-                self._config_loading = False
                 self._update_controls()
             if result.action == "start" and result.request_id == self._pending_start_request:
                 self._pending_start_request = None
@@ -1022,13 +1173,36 @@ class MainWindow(QMainWindow):
             mode_text = "仅提醒，不会点击" if self.mode == Mode.REMIND else "自动确认已由你手动开始"
             self.status_label.setText(f"本轮已手动开始（{session_id}）；{mode_text}。")
             self._update_controls()
-        elif result.action == "load_config":
-            revision, config = value
-            if revision == self._semantic_revision:
-                self._apply_loaded_config(config)
+        elif result.action in {"save_config", "save_config_as", "load_config"}:
+            if result.request_id != self._pending_profile_request:
+                return
+            action = self._pending_profile_action
+            self._pending_profile_request = None
+            self._pending_profile_action = None
+            if action == "load_config":
+                revision, path, config = value
+                if revision == self._semantic_revision:
+                    self._apply_loaded_config(config, path)
+                else:
+                    self._config_loading = False
+                    self.status_label.setText("载入结果已作废，因为你随后更改了设置。")
+                    self._update_controls()
+            elif action == "save_config_as":
+                path, revision = value
+                if revision == self._semantic_revision:
+                    self._set_current_config_path(path)
+                    self.status_label.setText("配置和模板已另存；本轮保持停止。")
+                else:
+                    self.status_label.setText(
+                        "已保存选择时的配置快照；设置随后已更改，当前配置位置未切换。"
+                    )
+                self._update_controls()
             else:
-                self._config_loading = False
-                self.status_label.setText("载入结果已作废，因为你随后更改了设置。")
+                _path, revision = value
+                if revision == self._semantic_revision:
+                    self.status_label.setText("当前配置和模板已保存。")
+                else:
+                    self.status_label.setText("已保存配置快照；设置随后已更改。")
                 self._update_controls()
         elif result.action == "import_template":
             if result.request_id != self._pending_import_request:
@@ -1157,8 +1331,14 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(self._pending_start_request is not None or state not in {
             None, State.DISARMED, State.SUCCESS, State.UNCONFIRMED, State.ERROR
         })
+        profile_available = (self._pending_profile_request is None
+                             and self._pending_import_request is None)
+        self.save_button.setEnabled(profile_available)
+        self.load_button.setEnabled(profile_available)
+        self.save_as_button.setEnabled(profile_available)
         self.import_button.setEnabled(self.geometry is not None and
-                                      self._pending_import_request is None)
+                                      self._pending_import_request is None and
+                                      self._pending_profile_request is None)
 
     def closeEvent(self, event: Any) -> None:
         if not self._shutdown_started:

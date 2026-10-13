@@ -179,8 +179,20 @@ class ConfigStore:
             self._atomic_write(destination, contents)
         self._atomic_write(self.config_path, encoded_config)
 
+    def save_to(self, path: Path, settings: Settings, region: Region,
+                button: Template | None, success: Template | None) -> None:
+        """Save a profile JSON and its templates beside the selected file."""
+        store = self._store_for_profile(path)
+        store.save(settings, region, button, success)
+
     def load(self) -> tuple[Settings, Region, Template | None, Template | None]:
+        return self._load(require_existing=False)
+
+    def _load(self, *, require_existing: bool
+              ) -> tuple[Settings, Region, Template | None, Template | None]:
         if not self.config_path.exists():
+            if require_existing:
+                raise ValueError(f"所选配置文件不存在：{self.config_path}")
             return Settings(), Region(), None, None
         try:
             try:
@@ -231,6 +243,33 @@ class ConfigStore:
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"配置文件内容无效：{exc}") from exc
         return settings, region, button, success
+
+    def load_from(self, path: Path) -> tuple[Settings, Region, Template | None, Template | None]:
+        """Load an explicit profile, reporting a missing selection as an error."""
+        store = self._store_for_profile(path, require_existing=True)
+        return store._load(require_existing=True)
+
+    @staticmethod
+    def _store_for_profile(path: Path, *, require_existing: bool = False) -> ConfigStore:
+        profile_path = Path(path)
+        if profile_path.suffix.lower() != ".json":
+            raise ValueError("配置文件必须使用 .json 扩展名")
+
+        try:
+            profile_parent = profile_path.parent.resolve()
+            resolved_profile = profile_path.resolve()
+            resolved_profile.relative_to(profile_parent)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError("配置文件路径必须位于所选文件的目录内") from exc
+
+        if profile_path.is_dir():
+            raise ValueError("所选配置路径必须是文件")
+        if require_existing and not profile_path.is_file():
+            raise ValueError(f"所选配置文件不存在或不是文件：{profile_path}")
+
+        store = ConfigStore(profile_path.parent)
+        store.config_path = profile_path
+        return store
 
     def _load_saved_template(self, entry: Any, key: str) -> Template | None:
         if entry is None:

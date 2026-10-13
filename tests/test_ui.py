@@ -11,11 +11,22 @@ import numpy as np
 import pytest
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QFileDialog
 
 from auto_ready.app import main
 from auto_ready.config import ConfigStore
-from auto_ready.models import Frame, Geometry, Identity, Mode, Rect, Region, Settings, State
-from auto_ready.ui import ImagePreview, MainWindow
+from auto_ready.models import (
+    Frame,
+    Geometry,
+    Identity,
+    Mode,
+    Rect,
+    Region,
+    Settings,
+    State,
+    Template,
+)
+from auto_ready.ui import ImagePreview, MainWindow, _WorkerResult
 
 
 @pytest.fixture
@@ -386,6 +397,313 @@ def test_loading_config_never_selects_or_enables_a_target(qtbot, close_main_wind
     assert window.target_combo.currentIndex() == 0
     assert window.engine.snapshot().state == State.DISARMED
     assert not window.start_button.isEnabled()
+
+
+def test_profile_dialogs_save_switch_and_update_the_selected_profile(
+    qtbot, tmp_path, close_main_windows, monkeypatch
+) -> None:
+    store = ConfigStore(tmp_path / "default")
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    profile_a = tmp_path / "profiles" / "profile-a.json"
+    profile_b = tmp_path / "profiles" / "profile-b.json"
+    save_paths = iter((profile_a, profile_b))
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName",
+        lambda *_args: (str(next(save_paths)), "JSON 配置 (*.json)"),
+    )
+
+    window.threshold_spin.setValue(0.901)
+    QTest.mouseClick(window.save_as_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
+    assert window._current_config_path == profile_a
+    assert window.current_config_label.text() == "当前配置：profile-a.json"
+    assert window.current_config_label.toolTip() == str(profile_a)
+    assert store.load_from(profile_a)[0].threshold == pytest.approx(0.901)
+
+    window.threshold_spin.setValue(0.921)
+    QTest.mouseClick(window.save_as_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
+    assert window._current_config_path == profile_b
+    assert store.load_from(profile_b)[0].threshold == pytest.approx(0.921)
+
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName",
+        lambda *_args: (str(profile_a), "JSON 配置 (*.json)"),
+    )
+    window.threshold_spin.setValue(0.941)
+    QTest.mouseClick(window.load_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not window._config_loading, timeout=3000)
+    qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
+    assert window.settings.threshold == pytest.approx(0.901)
+    assert window._current_config_path == profile_a
+    assert window.mode == Mode.REMIND
+    assert window.identity is None
+    assert window.engine.snapshot().state == State.DISARMED
+
+    window.threshold_spin.setValue(0.911)
+    window.save_config()
+    qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
+    assert store.load_from(profile_a)[0].threshold == pytest.approx(0.911)
+
+
+def test_profile_load_cancel_and_failure_preserve_config_and_path(
+    qtbot, tmp_path, close_main_windows, monkeypatch
+) -> None:
+    store = ConfigStore(tmp_path / "default")
+    broken_profile = tmp_path / "broken.json"
+    broken_profile.write_text("not json", encoding="utf-8")
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    original_settings = window.settings
+    original_path = window._current_config_path
+    selected_path = [""]
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName",
+        lambda *_args: (selected_path[0], "JSON 配置 (*.json)"),
+    )
+
+    window.choose_config_to_load()
+    assert window.settings == original_settings
+    assert window._current_config_path == original_path
+    assert window.engine.snapshot().state == State.DISARMED
+
+    selected_path[0] = str(broken_profile)
+    window.choose_config_to_load()
+    qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
+    assert window.settings == original_settings
+    assert window._current_config_path == original_path
+    assert window.current_config_label.text() == "当前配置：config.json"
+    assert not window._config_loading
+    assert window.engine.snapshot().state == State.DISARMED
+
+
+def test_stale_profile_load_releases_controls_without_applying_or_relabeling(
+    qtbot, tmp_path, close_main_windows, monkeypatch
+) -> None:
+    store = ConfigStore(tmp_path / "default")
+    profile = tmp_path / "stale.json"
+    ConfigStore(tmp_path).save_to(profile, Settings(threshold=0.903), Region(), None, None)
+    entered_load = threading.Event()
+    release_load = threading.Event()
+    load_from = store.load_from
+
+    def blocked_load(path):
+        entered_load.set()
+        assert release_load.wait(3)
+        return load_from(path)
+
+    monkeypatch.setattr(store, "load_from", blocked_load)
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName",
+        lambda *_args: (str(profile), "JSON 配置 (*.json)"),
+    )
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    original_path = window._current_config_path
+
+    window.choose_config_to_load()
+    qtbot.waitUntil(entered_load.is_set, timeout=3000)
+    window.threshold_spin.setValue(0.947)
+    release_load.set()
+    qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
+
+    assert window.settings.threshold == pytest.approx(0.947)
+    assert window._current_config_path == original_path
+    assert not window._config_loading
+    assert window.engine.snapshot().state == State.DISARMED
+    assert not window.start_button.isEnabled()
+
+
+def test_stale_save_as_writes_captured_path_without_switching_current_profile(
+    qtbot, tmp_path, close_main_windows, monkeypatch
+) -> None:
+    store = ConfigStore(tmp_path / "default")
+    profile = tmp_path / "saved-snapshot.json"
+    entered_save = threading.Event()
+    release_save = threading.Event()
+    save_to = store.save_to
+
+    def blocked_save(path, settings, region, button, success):
+        entered_save.set()
+        assert release_save.wait(3)
+        return save_to(path, settings, region, button, success)
+
+    monkeypatch.setattr(store, "save_to", blocked_save)
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName",
+        lambda *_args: (str(profile), "JSON 配置 (*.json)"),
+    )
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    original_path = window._current_config_path
+    original_label = window.current_config_label.text()
+    window.threshold_spin.setValue(0.911)
+
+    QTest.mouseClick(window.save_as_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(entered_save.is_set, timeout=3000)
+    window.threshold_spin.setValue(0.931)
+    release_save.set()
+    qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
+
+    assert profile.is_file()
+    assert store.load_from(profile)[0].threshold == pytest.approx(0.911)
+    assert window.settings.threshold == pytest.approx(0.931)
+    assert window._current_config_path == original_path
+    assert window.current_config_label.text() == original_label
+
+
+def test_cancelled_template_import_stops_active_round_before_opening_picker(
+    qtbot, tmp_path, close_main_windows, monkeypatch
+) -> None:
+    backend = FakeBackend()
+    input_adapter = FakeInput()
+    store = ConfigStore(tmp_path)
+    window = MainWindow(backend=backend, input_adapter=input_adapter, store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    qtbot.waitUntil(lambda: window.target_combo.count() == 2, timeout=3000)
+    window.target_combo.setCurrentIndex(1)
+    qtbot.waitUntil(lambda: window.geometry == backend.geometry, timeout=3000)
+    old_template = Template(
+        backend.success_image[42:66, 130:162].copy(),
+        (backend.geometry.width, backend.geometry.height), backend.geometry.dpi,
+        "保留的按钮模板",
+    )
+    window.button = old_template
+    assert window._configure_engine()
+    assert window.engine.start()
+    qtbot.waitUntil(lambda: window.engine.snapshot().state == State.MONITORING, timeout=3000)
+    window.selection_combo.setCurrentIndex(1)
+    original_path = window._current_config_path
+    picker_state: list[State] = []
+
+    def cancel_import(*_args):
+        picker_state.append(window.engine.snapshot().state)
+        assert input_adapter.calls == []
+        return "", "PNG 图片 (*.png)"
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", cancel_import)
+    window.import_template()
+
+    assert picker_state == [State.DISARMED]
+    assert window.engine.snapshot().state == State.DISARMED
+    assert input_adapter.calls == []
+    assert window.button is old_template
+    assert window._current_config_path == original_path
+    assert window._pending_import_request is None
+
+
+def test_profile_and_import_actions_exclude_each_other_and_release_after_failure(
+    qtbot, tmp_path, close_main_windows, monkeypatch
+) -> None:
+    store = ConfigStore(tmp_path / "default")
+    profile = tmp_path / "profile.json"
+    ConfigStore(tmp_path / "profiles").save_to(
+        profile, Settings(threshold=0.913), Region(), None, None
+    )
+    load_entered = threading.Event()
+    release_load = threading.Event()
+    load_from = store.load_from
+
+    def blocked_load(path):
+        load_entered.set()
+        assert release_load.wait(3)
+        return load_from(path)
+
+    monkeypatch.setattr(store, "load_from", blocked_load)
+    open_calls: list[str] = []
+    dialogs = [(str(profile), "JSON 配置 (*.json)"), ("fake-template.png", "PNG (*.png)")]
+
+    def select_dialog(_parent, title, *_args):
+        open_calls.append(title)
+        return dialogs[len(open_calls) - 1]
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", select_dialog)
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    qtbot.waitUntil(lambda: window.target_combo.count() == 2, timeout=3000)
+    window.target_combo.setCurrentIndex(1)
+    qtbot.waitUntil(lambda: window.geometry == window.backend.geometry, timeout=3000)
+
+    window.choose_config_to_load()
+    qtbot.waitUntil(load_entered.is_set, timeout=3000)
+    assert not window.import_button.isEnabled()
+    window.import_template()
+    assert open_calls == ["选择并载入配置"]
+
+    release_load.set()
+    qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
+    assert window.import_button.isEnabled()
+
+    import_entered = threading.Event()
+    release_import = threading.Event()
+
+    def blocked_template_load(_path, _geometry):
+        import_entered.set()
+        assert release_import.wait(3)
+        raise ValueError("mock template failure")
+
+    monkeypatch.setattr("auto_ready.config.load_template", blocked_template_load)
+    window.selection_combo.setCurrentIndex(1)
+    window.import_template()
+    qtbot.waitUntil(import_entered.is_set, timeout=3000)
+    assert not window.load_button.isEnabled()
+    window.choose_config_to_load()
+    assert len(open_calls) == 2
+
+    release_import.set()
+    qtbot.waitUntil(lambda: window._pending_import_request is None, timeout=3000)
+    assert window.load_button.isEnabled()
+    assert window.import_button.isEnabled()
+
+
+def test_profile_result_survives_generic_worker_result_overflow(
+    qtbot, tmp_path, close_main_windows, monkeypatch
+) -> None:
+    store = ConfigStore(tmp_path / "default")
+    profile = tmp_path / "durable.json"
+    ConfigStore(tmp_path / "profiles").save_to(
+        profile, Settings(threshold=0.917), Region(), None, None
+    )
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName",
+        lambda *_args: (str(profile), "JSON 配置 (*.json)"),
+    )
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    window._timer.stop()
+    window.choose_config_to_load()
+    qtbot.waitUntil(lambda: window.worker._profile_result is not None, timeout=3000)
+    profile_result = window.worker._profile_result
+    assert profile_result is not None
+    for request_id in range(100, 112):
+        window.worker._record_result(_WorkerResult(request_id, "tick", error="noise"))
+
+    results = window.worker.take_results()
+    assert len(results) == 9
+    assert results[-1] == profile_result
+    for result in results:
+        window._handle_result(result)
+
+    assert window.settings.threshold == pytest.approx(0.917)
+    assert window._current_config_path == profile
+    assert window._pending_profile_request is None
+    assert not window._config_loading
+    assert window.load_button.isEnabled()
 
 
 def test_legacy_f12_config_requires_explicit_migration_without_rewriting_file(
