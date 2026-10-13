@@ -325,6 +325,50 @@ def test_hotkey_revokes_start_while_worker_is_inside_start(qtbot, close_main_win
     assert input_adapter.calls == []
 
 
+def test_failed_restart_shows_frozen_previous_duration(qtbot, close_main_windows) -> None:
+    backend = FakeBackend()
+    input_adapter = FakeInput()
+    window = MainWindow(backend=backend, input_adapter=input_adapter, store=FakeStore(),
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    qtbot.waitUntil(lambda: window.target_combo.count() == 2, timeout=3000)
+    window.target_combo.setCurrentIndex(1)
+    qtbot.waitUntil(lambda: window.geometry == backend.geometry, timeout=3000)
+    window.capture_static()
+    qtbot.waitUntil(lambda: window._static_frame is not None, timeout=3000)
+    window.selection_combo.setCurrentIndex(1)
+    window._selection_made(Rect(76, 42, 32, 24))
+    fake_clock = FakeClock(backend._last_captured_at + 0.01)
+    backend.clock = window.engine.clock = fake_clock
+    backend.foreground_active = False
+    window.start_round()
+    qtbot.waitUntil(lambda: window.engine.snapshot().state == State.PAUSED, timeout=3000)
+    window.stop_round()
+    completed = window.engine.snapshot()
+
+    def minimized(_identity):
+        raise RuntimeError("The selected window is minimized")
+
+    backend.inspect = minimized
+    window.start_round()
+    qtbot.waitUntil(lambda: window.status_label.text().startswith("无法开始："), timeout=3000)
+    expected = f"上轮用时（已结束）：{completed.elapsed:.1f} 秒"
+    qtbot.waitUntil(lambda: expected in window.candidates_text.toPlainText(), timeout=3000)
+    with fake_clock.lock:
+        fake_clock.value += 180
+    qtbot.wait(250)
+    window._refresh_worker_state()
+    snapshot = window.engine.snapshot()
+    assert snapshot.state == State.DISARMED
+    assert snapshot.session_id == completed.session_id
+    assert snapshot.elapsed == completed.elapsed
+    assert expected in window.candidates_text.toPlainText()
+    assert not window.pause_button.isEnabled()
+    assert not window.resume_button.isEnabled()
+    assert not window.stop_button.isEnabled()
+    assert input_adapter.calls == []
+
+
 def test_startup_smoke_test_closes_without_input(qtbot) -> None:
     del qtbot
     assert main(["--smoke-test"]) == 0

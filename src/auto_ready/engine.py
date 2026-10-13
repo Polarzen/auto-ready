@@ -62,6 +62,7 @@ class Engine:
         self._notified = False
         self._manual_pause = False
         self._started = 0.0
+        self._ended_at: float | None = None
         self._attempted_at = 0.0
         self._last_sequence = -1
         self._last_time = -1.0
@@ -96,6 +97,8 @@ class Engine:
                    captured_at=frame.captured_at, geometry=asdict(frame.geometry))
 
     def _transition(self, state, reason):
+        if state in TERMINAL and self._session and self._ended_at is None:
+            self._ended_at = self.clock()
         if (self._state, self._reason) != (state, reason):
             self._state, self._reason = state, reason
             self.history.append((self._session, state, reason))
@@ -165,6 +168,7 @@ class Engine:
             self._cancel = threading.Event()
             self._pause_requested.clear()
             self._started = self.clock()
+            self._ended_at = None
             self._attempted = self._notified = self._manual_pause = False
             self._last_sequence, self._last_time = -1, -1.0
             self._geometry, self._stable_since = geometry, self.clock()
@@ -210,6 +214,10 @@ class Engine:
 
     def snapshot(self):
         with self._lock:
+            elapsed = 0
+            if self._session:
+                ended_at = self._ended_at if self._ended_at is not None else self.clock()
+                elapsed = max(0, ended_at - self._started)
             return Snapshot(
                 self._state,
                 self._reason,
@@ -218,7 +226,7 @@ class Engine:
                 self._count,
                 self._detection,
                 self._frame,
-                max(0, self.clock() - self._started) if self._session else 0,
+                elapsed,
             )
 
     def _notify(self):

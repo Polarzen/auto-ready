@@ -450,3 +450,109 @@ def test_success_evidence_must_stay_at_same_location_across_new_frames(rig):
         assert engine.snapshot().state == State.VERIFYING
     run(rig, 1)
     assert engine.snapshot().state == State.SUCCESS
+
+
+def test_elapsed_freezes_at_first_terminal_transition_even_at_clock_zero(rig):
+    engine, _, adapter, _, clock = rig
+    clock.now = 0.0
+    engine.start()
+    engine.stop()
+    stopped = engine.snapshot()
+    assert stopped.state == State.DISARMED
+    assert stopped.elapsed == 0
+
+    clock.advance(5)
+    engine.stop("重复停止")
+    assert engine.snapshot().elapsed == stopped.elapsed
+    assert adapter.points == []
+
+
+@pytest.mark.parametrize("terminal", [State.SUCCESS, State.UNCONFIRMED, State.ERROR])
+def test_terminal_finish_freezes_elapsed_without_input(rig, terminal):
+    engine, _, adapter, _, clock = rig
+    engine.start()
+    clock.advance(1.25)
+    engine._finish(terminal, "测试终态")
+    finished = engine.snapshot()
+    assert finished.state == terminal
+
+    clock.advance(4)
+    assert engine.snapshot().elapsed == finished.elapsed
+    assert adapter.points == []
+
+
+def test_emergency_stop_transition_freezes_elapsed(rig):
+    engine, _, adapter, _, clock = rig
+    engine.start()
+    clock.advance(1.25)
+    engine.set_hotkey_available(False)
+    finished = engine.snapshot()
+    assert finished.state == State.ERROR
+
+    clock.advance(4)
+    assert engine.snapshot().elapsed == finished.elapsed
+    assert adapter.points == []
+
+
+def test_failed_initial_start_keeps_elapsed_at_zero(rig):
+    engine, _, adapter, _, clock = rig
+    engine.configure(None, None)
+    clock.advance(5)
+    with pytest.raises(ValueError):
+        engine.start()
+
+    clock.advance(4)
+    assert engine.snapshot().state == State.DISARMED
+    assert engine.snapshot().elapsed == 0
+    assert adapter.points == []
+
+
+def test_failed_restart_preserves_previous_completed_elapsed(rig):
+    engine, backend, adapter, _, clock = rig
+    session = engine.start()
+    clock.advance(1.25)
+    engine.stop()
+    completed = engine.snapshot().elapsed
+    clock.advance(3)
+    backend.valid = False
+
+    with pytest.raises(RuntimeError, match="目标已关闭"):
+        engine.start()
+
+    snapshot = engine.snapshot()
+    assert snapshot.session_id == session
+    assert snapshot.state == State.DISARMED
+    assert snapshot.elapsed == completed
+    assert adapter.points == []
+
+
+def test_successful_restart_resets_elapsed_and_advances(rig):
+    engine, _, adapter, _, clock = rig
+    first_session = engine.start()
+    clock.advance(1.25)
+    engine.stop()
+    clock.advance(3)
+
+    second_session = engine.start()
+    assert second_session != first_session
+    assert engine.snapshot().elapsed == 0
+    clock.advance(0.75)
+    assert engine.snapshot().elapsed == pytest.approx(0.75)
+    assert adapter.points == []
+
+
+def test_paused_time_still_counts_toward_round_timeout(rig):
+    engine, _, adapter, _, clock = rig
+    engine.configure(
+        engine.identity,
+        engine.button,
+        settings=Settings(round_timeout=5),
+        mode=Mode.AUTO,
+    )
+    engine.start()
+    engine.pause()
+    clock.advance(6)
+    engine.resume()
+
+    assert engine.tick().state == State.UNCONFIRMED
+    assert adapter.points == []

@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .engine import Engine
+from .engine import TERMINAL, Engine
 from .models import (
     Frame,
     Geometry,
@@ -1098,8 +1098,15 @@ class MainWindow(QMainWindow):
                 self._last_displayed_key = key
                 self.geometry = snapshot.frame.geometry
                 self._update_target_info(self.geometry)
+        elapsed_label = "已用（含暂停）"
+        if not snapshot.session_id:
+            elapsed_label = "已用"
+        elif snapshot.state in TERMINAL:
+            elapsed_label = ("上轮用时（已结束）" if snapshot.state == State.DISARMED
+                             else "本轮用时（已结束）")
         details = [f"状态：{snapshot.state.value}", f"原因：{snapshot.reason}",
-                   f"轮次：{snapshot.session_id or '无'}", f"已用：{snapshot.elapsed:.1f} 秒"]
+                   f"轮次：{snapshot.session_id or '无'}",
+                   f"{elapsed_label}：{snapshot.elapsed:.1f} 秒"]
         self.state_label.setText(f"{snapshot.state.value} · {snapshot.reason}")
         if snapshot.detection is not None:
             detection = snapshot.detection
