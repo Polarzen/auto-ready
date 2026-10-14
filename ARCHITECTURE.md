@@ -1,4 +1,4 @@
-# Implementation contract — 0.4.0
+# Implementation contract — 0.4.2
 
 ## Data and capability boundaries
 
@@ -89,15 +89,37 @@ controls. The four-step wizard owns a temporary draft until an explicit successf
 failed capture preserve the previous active templates/path. Production matching supplies no-click
 checks; unconfirmed setup may be saved with an honest label and without a success marker.
 
-Profile names are readable. Unsaved edits require save/discard/cancel before switching. I/O uses
+Profiles have editable display names and game labels; canonical file paths remain their identity.
+The dashboard displays the active profile, and duplicate names are disambiguated with file information.
+Renaming updates metadata without moving JSON or templates. Metadata changes become active only after
+a successful, current save completion. Game labels do not select or authorize target windows.
+Unsaved edits require save/discard/cancel before switching. I/O uses
 immutable request snapshots. Revision/request-ID/authorization epochs reject stale load/save/start
 results. One durable profile completion slot prevents diagnostic noise dropping completion. Disk,
 capture and resource waits stay off the GUI thread. Capture callbacks never dispatch GUI-dependent work.
 
 ConfigStore retains schema 1 and v0.3 JSON plus templates compatibility. Optional capture_method=auto
 and sound_enabled=true migrate only in memory until explicit save. JSON replacement remains atomic
-after unique template files; different profiles do not overwrite each other's images. Path/size checks
-remain; no runtime identity or permission is written.
+after template assets are ready; different profiles do not overwrite each other's images. Path/size checks
+remain; no runtime identity or permission is written. Optional profile={name,game} metadata accepts
+legacy documents without rewriting them. Names and games are bounded strings; unknown fields and
+malformed metadata fail validation. Loading settings and metadata uses the same document snapshot.
+Profile discovery reads bounded metadata on the worker without decoding template images.
+
+Startup loads the default profile contents asynchronously; listing its metadata does not mark
+its templates/settings as loaded. Save/rename/edit/SaveAs require a valid loaded or fresh profile.
+A missing default is a fresh profile, while a corrupt default remains unloaded and cannot be
+overwritten from empty UI state. Failed replacement loads preserve the prior valid profile.
+Static crop previews use the owned in-memory template images and do not capture or authorize input.
+They remain available without a target and when target geometry is incompatible. Geometry/DPI
+compatibility is still required for detection; no rescaling or implicit window binding is added.
+
+Editing a profile snapshots its metadata/templates and original destination; successful save updates
+that exact JSON. New-profile setup starts an independent empty draft and requires a new destination.
+Loading another profile from the wizard discards the draft only after a successful current load.
+New template assets are addressed by encoded PNG content hash. A validated matching legacy reference
+may be reused, and an existing hash-named file must match before reuse. Shared images are immutable;
+JSON replacement remains last, reference geometry stays per template, and historical assets remain.
 
 Tray hide is explicit. Normal close stops and exits. Notifications do not activate/show the main
 window automatically; clicking a notification never authorizes a round or input. Stop is reachable

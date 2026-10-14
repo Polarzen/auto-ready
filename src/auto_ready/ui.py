@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import time
+import unicodedata
 import uuid
 from collections import deque
 from dataclasses import dataclass, replace
@@ -47,6 +49,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .config import ProfileMetadata
 from .engine import TERMINAL, Engine
 from .models import (
     Frame,
@@ -61,6 +64,67 @@ from .models import (
     Template,
     preview_to_pixel,
 )
+from .profile_dialogs import (
+    ProfileChoice,
+    ProfileMetadataDialog,
+    ProfileSelectionDialog,
+)
+from .template_preview import TemplatePreviewDialog, TemplateThumbnail
+
+
+def _fallback_profile_metadata(path: Path | None, default_path: Path | None) -> ProfileMetadata:
+    if path is None or (
+        default_path is not None
+        and Path(path).resolve() == Path(default_path).resolve()
+    ):
+        name = "默认配置"
+    else:
+        stem = Path(path).stem
+        name = "".join(
+            "�" if unicodedata.category(character) == "Cc" else character
+            for character in stem
+        )[:80] or "默认配置"
+    return ProfileMetadata(name, "未标注游戏")
+
+
+def _display_profile_metadata(
+    metadata: ProfileMetadata, path: Path | None, default_path: Path | None
+) -> ProfileMetadata:
+    metadata.validate()
+    fallback = _fallback_profile_metadata(path, default_path)
+    display_metadata = ProfileMetadata(
+        metadata.name or fallback.name, metadata.game or fallback.game
+    )
+    display_metadata.validate()
+    return display_metadata
+
+
+def _snapshot_template(template: Template | None) -> Template | None:
+    if template is None:
+        return None
+    return Template(
+        np.ascontiguousarray(template.image).copy(),
+        tuple(template.reference_size),
+        template.dpi,
+        template.name,
+    )
+
+
+def _snapshot_frame(frame: Frame | None) -> Frame | None:
+    if frame is None:
+        return None
+    return replace(frame, image=np.ascontiguousarray(frame.image).copy())
+
+
+def _snapshot_onboarding_draft(draft: Any) -> Any:
+    return replace(
+        draft,
+        button=_snapshot_template(draft.button),
+        success=_snapshot_template(draft.success),
+        frame=_snapshot_frame(draft.frame),
+        original_button=_snapshot_template(draft.original_button),
+        original_success=_snapshot_template(draft.original_success),
+    )
 
 
 @dataclass(frozen=True)
@@ -104,8 +168,26 @@ class _IOWorker(QThread):
         try:
             self._commands.put_nowait((request_id, action, payload))
         except queue.Full:
-            return None
+            # A requested profile load is state-changing and must retain a lane
+            # behind already queued work. Replace one stale profile-list read
+            # rather than silently rejecting the user's switch at queue pressure.
+            if action != "load_config" or not self._make_room_for_profile_load():
+                return None
+            try:
+                self._commands.put_nowait((request_id, action, payload))
+            except queue.Full:
+                return None
         return request_id
+
+    def _make_room_for_profile_load(self) -> bool:
+        commands = self._commands
+        with commands.mutex:
+            for index, (_request_id, action, _payload) in enumerate(commands.queue):
+                if action == "list_profiles":
+                    del commands.queue[index]
+                    commands.not_full.notify()
+                    return True
+        return False
 
     def invalidate_authorization(self) -> None:
         """Revoke queued start commands before a stop signal is processed."""
@@ -210,26 +292,53 @@ class _IOWorker(QThread):
 
             return identity, draft_revision, match(frame, button, region, settings)
         if action == "wizard_save":
-            path, settings, region, button, success = payload
-            if path is None:
-                self._store.save(settings, region, button, success)
-            else:
-                profile_path = Path(path)
-                if profile_path.exists():
+            intent, path, draft, metadata = payload
+            profile_path = Path(path) if path is not None else None
+            if intent == "edit":
+                if profile_path is None:
+                    raise ValueError("当前配置路径不可用，无法保存编辑结果。")
+                default_path = getattr(self._store, "config_path", None)
+                if (default_path is not None
+                        and profile_path.resolve() == Path(default_path).resolve()):
+                    self._store.save(
+                        draft.settings, draft.region, draft.button, draft.success,
+                        metadata=metadata,
+                    )
+                else:
+                    self._store.save_to(
+                        profile_path, draft.settings, draft.region, draft.button,
+                        draft.success, metadata=metadata,
+                    )
+            elif intent == "new":
+                if profile_path is None:
+                    raise ValueError("新配置路径不可用。")
+                if profile_path.exists() or profile_path.is_symlink():
                     raise ValueError("该名称的配置已存在；请选择另一个名称以保留旧配置。")
-                self._store.save_to(profile_path, settings, region, button, success)
-            return path
+                self._store.save_to(
+                    profile_path, draft.settings, draft.region, draft.button,
+                    draft.success, metadata=metadata,
+                )
+            else:
+                raise ValueError("未知的向导保存意图。")
+            return intent, profile_path, draft, metadata
         if action == "list_profiles":
             roots = tuple(Path(root) for root in payload if root is not None)
-            profiles: dict[Path, str] = {}
+            profiles: dict[Path, ProfileMetadata] = {}
             for root in roots:
                 try:
                     for path in root.glob("*.json"):
                         if path.is_file():
-                            profiles[path.resolve()] = path.stem
+                            try:
+                                profiles[path.resolve()] = self._store.read_profile_metadata(path)
+                            except (OSError, ValueError):
+                                # Malformed unrelated profile files do not hide valid choices.
+                                continue
                 except OSError:
                     continue
-            return sorted(profiles.items(), key=lambda item: (item[1].casefold(), str(item[0])))
+            return sorted(
+                profiles.items(),
+                key=lambda item: (item[1].game.casefold(), item[1].name.casefold(), str(item[0])),
+            )
         if action == "set_capture_method":
             setter = getattr(self._backend, "set_capture_method", None)
             if setter is None:
@@ -267,21 +376,28 @@ class _IOWorker(QThread):
                 raise RuntimeError("识别设置已更改，已取消排队中的开始操作")
             return revision, session_id, allow_activation
         if action == "save_config":
-            path, revision, settings, region, button, success = payload
+            path, revision, settings, region, button, success, metadata = payload
             default_path = getattr(self._store, "config_path", None)
             if path is None or (default_path is not None and Path(path) == Path(default_path)):
-                self._store.save(settings, region, button, success)
+                self._store.save(settings, region, button, success, metadata=metadata)
             else:
-                self._store.save_to(Path(path), settings, region, button, success)
-            return Path(path) if path is not None else None, revision
+                self._store.save_to(
+                    Path(path), settings, region, button, success, metadata=metadata
+                )
+            return Path(path) if path is not None else None, revision, metadata
         if action == "save_config_as":
-            path, revision, settings, region, button, success = payload
+            path, revision, settings, region, button, success, metadata = payload
             profile_path = Path(path)
-            self._store.save_to(profile_path, settings, region, button, success)
-            return profile_path, revision
+            self._store.save_to(
+                profile_path, settings, region, button, success, metadata=metadata
+            )
+            return profile_path, revision, metadata
         if action == "load_config":
             path, revision = payload
-            config = self._store.load() if path is None else self._store.load_from(Path(path))
+            config = (
+                self._store.load_profile()
+                if path is None else self._store.load_profile(Path(path))
+            )
             return revision, path, config
         if action == "import_template":
             path, geometry, identity, revision, template_kind = payload
@@ -518,8 +634,18 @@ class MainWindow(QMainWindow):
         self._pending_profile_request: int | None = None
         self._pending_profile_action: str | None = None
         self._config_loading = False
+        self._profile_content_ready = False
+        self._profile_content_error = ""
+        self._startup_default_load_started = False
+        self._startup_load_retry_scheduled = False
+        self._loading_from_wizard = False
+        self._pending_profile_switch_from_wizard = False
         config_path = getattr(self.store, "config_path", None)
         self._current_config_path = Path(config_path) if config_path is not None else None
+        self._current_profile_metadata = _fallback_profile_metadata(
+            self._current_config_path, Path(config_path) if config_path is not None else None
+        )
+        self._current_profile_metadata_initialized = False
         self._refreshing_targets = False
         self._hotkey_available = False
         self._hotkey_error = ""
@@ -529,8 +655,9 @@ class MainWindow(QMainWindow):
         self._shutdown_poll_timer: QTimer | None = None
         self._manual_pause_requested = False
         self._allow_activation_round = False
-        self._profile_paths: dict[str, Path] = {}
+        self._known_profiles: dict[Path, ProfileMetadata] = {}
         self._pending_profile_switch: Path | None = None
+        self._pending_profile_switch_active = False
         self._saved_config_signature: tuple[Any, ...] | None = None
         self._capture_backend_name = "unselected"
         self._wizard: Any = None
@@ -542,6 +669,8 @@ class MainWindow(QMainWindow):
         self._tray_icon: QSystemTrayIcon | None = None
         self._tray_status_action: QAction | None = None
         self._last_dashboard_status: tuple[State, str] | None = None
+        self._start_failure_key: tuple[State, str] | None = None
+        self._start_failure_message = ""
 
         self.engine = Engine(self.backend, input_adapter, self._notifier)
         self.worker = _IOWorker(
@@ -560,8 +689,8 @@ class MainWindow(QMainWindow):
             self._install_hotkey()
             self.worker.start()
             self._timer.start(80)
+            QTimer.singleShot(0, self._load_startup_default_profile)
             QTimer.singleShot(0, self.refresh_targets)
-            QTimer.singleShot(0, self._refresh_profiles)
         except Exception:
             self.engine.close()
             self.worker.shutdown()
@@ -710,6 +839,7 @@ class MainWindow(QMainWindow):
         config_layout = QVBoxLayout(config_box)
         self.current_config_label = QLabel()
         self.current_config_label.setWordWrap(True)
+        self.current_config_label.setTextFormat(Qt.TextFormat.PlainText)
         self._update_current_config_label()
         self.save_button = QPushButton("明确保存配置和模板")
         self.save_button.clicked.connect(self.save_config)
@@ -747,11 +877,61 @@ class MainWindow(QMainWindow):
         self.profile_combo = QComboBox()
         self.profile_combo.addItem("默认配置", None)
         self.profile_combo.currentIndexChanged.connect(self._profile_combo_changed)
+        self.profile_combo.activated.connect(self._profile_combo_activated)
         profile_row.addWidget(self.profile_combo, 1)
         self.profile_status_label = QLabel()
         self.profile_status_label.setMinimumWidth(90)
         profile_row.addWidget(self.profile_status_label)
         outer.addLayout(profile_row)
+        outer.addWidget(self.current_config_label)
+
+        template_box = QGroupBox("当前配置的模板")
+        template_layout = QVBoxLayout(template_box)
+        template_images = QHBoxLayout()
+        button_template_column = QVBoxLayout()
+        self.button_template_thumbnail = TemplateThumbnail(112, 64, content)
+        self.button_template_status = QLabel()
+        self.button_template_status.setWordWrap(True)
+        button_template_column.addWidget(self.button_template_thumbnail, 0,
+                                         Qt.AlignmentFlag.AlignLeft)
+        button_template_column.addWidget(self.button_template_status)
+        success_template_column = QVBoxLayout()
+        self.success_template_thumbnail = TemplateThumbnail(112, 64, content)
+        self.success_template_status = QLabel()
+        self.success_template_status.setWordWrap(True)
+        success_template_column.addWidget(self.success_template_thumbnail, 0,
+                                          Qt.AlignmentFlag.AlignLeft)
+        success_template_column.addWidget(self.success_template_status)
+        template_images.addLayout(button_template_column, 1)
+        template_images.addLayout(success_template_column, 1)
+        template_layout.addLayout(template_images)
+        template_actions = QHBoxLayout()
+        self.template_preview_button = QPushButton("查看模板…")
+        self.template_preview_button.clicked.connect(self.show_template_preview)
+        template_actions.addWidget(self.template_preview_button)
+        template_actions.addStretch(1)
+        template_layout.addLayout(template_actions)
+        outer.addWidget(template_box)
+
+        profile_actions = QHBoxLayout()
+        self.rename_profile_button = QPushButton("重命名…")
+        self.rename_profile_button.clicked.connect(self.rename_profile)
+        self.load_profile_dashboard_button = QPushButton("载入配置…")
+        self.load_profile_dashboard_button.clicked.connect(self.choose_config_to_load)
+        profile_actions.addWidget(self.rename_profile_button, 1)
+        profile_actions.addWidget(self.load_profile_dashboard_button, 1)
+        outer.addLayout(profile_actions)
+        save_as_row = QHBoxLayout()
+        self.save_as_dashboard_button = QPushButton("另存为…")
+        self.save_as_dashboard_button.clicked.connect(self.save_config_as)
+        self.new_profile_button = QPushButton("新建配置…")
+        self.new_profile_button.clicked.connect(
+            lambda _checked=False: self.open_onboarding(new_profile=True)
+        )
+        save_as_row.addWidget(self.new_profile_button)
+        save_as_row.addWidget(self.save_as_dashboard_button)
+        save_as_row.addStretch(1)
+        outer.addLayout(save_as_row)
 
         target_box = QGroupBox("目标窗口")
         target_row = QHBoxLayout(target_box)
@@ -794,7 +974,9 @@ class MainWindow(QMainWindow):
 
         utility = QHBoxLayout()
         self.onboarding_button = QPushButton("开始设置")
-        self.onboarding_button.clicked.connect(self.open_onboarding)
+        self.onboarding_button.clicked.connect(
+            lambda _checked=False: self.open_onboarding()
+        )
         self.preview_button.setText("无点击检查")
         self.advanced_button = QPushButton("高级设置与诊断…")
         self.advanced_button.clicked.connect(self.show_advanced)
@@ -818,6 +1000,8 @@ class MainWindow(QMainWindow):
         root_layout.addLayout(controls)
         self.setCentralWidget(dashboard)
 
+        self.template_preview_dialog = TemplatePreviewDialog(self)
+
         self.advanced_dialog = QDialog(self)
         self.advanced_dialog.setWindowTitle("高级设置与诊断")
         self.advanced_dialog.resize(900, 720)
@@ -828,6 +1012,7 @@ class MainWindow(QMainWindow):
         dialog_layout.addWidget(scroll)
         self._create_tray()
         self._saved_config_signature = self._config_signature()
+        self._refresh_template_preview()
 
     def _primary_action(self) -> None:
         if self.engine.snapshot().state == State.PAUSED and self._manual_pause_requested:
@@ -942,14 +1127,17 @@ class MainWindow(QMainWindow):
         )
 
     def _update_dirty_state(self) -> None:
-        dirty = self._saved_config_signature is not None and (
+        dirty = self._profile_content_ready and self._saved_config_signature is not None and (
             self._config_signature() != self._saved_config_signature
         )
         if hasattr(self, "profile_status_label"):
-            self.profile_status_label.setText("未保存修改" if dirty else "已保存")
-        if hasattr(self, "current_config_label"):
-            text = self.current_config_label.text().split(" · 未保存修改")[0]
-            self.current_config_label.setText(text + (" · 未保存修改" if dirty else ""))
+            if not self._profile_content_ready:
+                state = "载入失败" if self._profile_content_error else "尚未载入"
+                self.profile_status_label.setText(state)
+            else:
+                self.profile_status_label.setText("未保存修改" if dirty else "已保存")
+        self._update_current_config_label(dirty=dirty)
+        self._refresh_template_preview()
         return None
 
     def _profile_roots(self) -> tuple[Path, ...]:
@@ -971,20 +1159,137 @@ class MainWindow(QMainWindow):
     def _refresh_profiles(self) -> None:
         self._queue("list_profiles", self._profile_roots())
 
+    def _populate_profile_combo(self, profiles: list[tuple[Path, ProfileMetadata]]) -> None:
+        default_path_value = getattr(self.store, "config_path", None)
+        default_path = (
+            Path(default_path_value).resolve() if default_path_value is not None else None
+        )
+        self._known_profiles = {
+            Path(path).resolve(): _display_profile_metadata(
+                metadata, Path(path).resolve(), default_path
+            )
+            for path, metadata in profiles
+        }
+        current_path = (
+            Path(self._current_config_path).resolve()
+            if self._current_config_path is not None else default_path
+        )
+
+        default_metadata = (
+            self._known_profiles.get(default_path)
+            if default_path is not None else None
+        )
+        if default_metadata is None:
+            default_metadata = _fallback_profile_metadata(default_path, default_path)
+
+        rows: list[tuple[Path | None, ProfileMetadata]] = [(None, default_metadata)]
+        rows.extend(
+            (path, metadata)
+            for path, metadata in sorted(
+                self._known_profiles.items(),
+                key=lambda item: (
+                    item[1].game.casefold(), item[1].name.casefold(), str(item[0])
+                ),
+            )
+            if path != default_path
+        )
+        selection_path = current_path
+        if self._pending_profile_switch_active:
+            selection_path = (
+                Path(self._pending_profile_switch).resolve()
+                if self._pending_profile_switch is not None else default_path
+            )
+        if (selection_path is not None and selection_path != default_path
+                and all(path != selection_path for path, _metadata in rows)):
+            rows.append(
+                (
+                    selection_path,
+                    self._known_profiles.get(
+                        selection_path,
+                        _fallback_profile_metadata(selection_path, default_path),
+                    ),
+                )
+            )
+
+        base_labels = [self._profile_display_name(metadata) for _path, metadata in rows]
+        counts: dict[str, int] = {}
+        for label in base_labels:
+            counts[label] = counts.get(label, 0) + 1
+        labels: list[str] = []
+        for (path, _metadata), label in zip(rows, base_labels, strict=True):
+            source_path = path if path is not None else default_path
+            if counts[label] > 1 and source_path is not None:
+                label = f"{label} · {source_path.name}"
+            labels.append(label)
+        second_counts: dict[str, int] = {}
+        for label in labels:
+            second_counts[label] = second_counts.get(label, 0) + 1
+        labels = [
+            f"{label} · {(path if path is not None else default_path).parent}"
+            if second_counts[label] > 1 and (path is not None or default_path is not None)
+            else label
+            for (path, _metadata), label in zip(rows, labels, strict=True)
+        ]
+
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        for (path, _metadata), label in zip(rows, labels, strict=True):
+            self.profile_combo.addItem(label, path)
+            item_path = path if path is not None else default_path
+            if item_path is not None:
+                self.profile_combo.setItemData(
+                    self.profile_combo.count() - 1, str(item_path), Qt.ItemDataRole.ToolTipRole
+                )
+        if selection_path is None or selection_path == default_path:
+            index = self.profile_combo.findData(None)
+        else:
+            index = self._profile_combo_index(selection_path)
+        self.profile_combo.setCurrentIndex(max(0, index))
+        self.profile_combo.blockSignals(False)
+
+    def _profile_choices(self) -> list[ProfileChoice]:
+        choices = []
+        for path, metadata in sorted(
+            self._known_profiles.items(),
+            key=lambda item: (item[1].game.casefold(), item[1].name.casefold(), str(item[0])),
+        ):
+            label = (
+                f"{self._profile_display_name(metadata)}\n"
+                f"文件：{path.name}\n路径：{path}"
+            )
+            choices.append(ProfileChoice(path, metadata, label))
+        return choices
+
     def _profile_combo_changed(self, index: int) -> None:
         if index < 0 or not hasattr(self, "profile_combo"):
             return
         selected = self.profile_combo.itemData(index)
         path = Path(selected) if selected is not None else None
         default_path = getattr(self.store, "config_path", None)
-        is_current_default = path is None and self._current_config_path == default_path
-        if is_current_default or path == self._current_config_path:
+        current_path = self._current_config_path
+        current_is_default = current_path is None or (
+            default_path is not None
+            and Path(current_path).resolve() == Path(default_path).resolve()
+        )
+        is_current_default = path is None and current_is_default
+        is_current_path = (
+            path is not None and current_path is not None
+            and Path(path).resolve() == Path(current_path).resolve()
+        )
+        if (is_current_default or is_current_path) and self._profile_content_ready:
             return
+        self._request_profile_switch(path)
+
+    def _profile_combo_activated(self, index: int) -> None:
+        if index < 0 or self._profile_content_ready or self._pending_profile_request is not None:
+            return
+        selected = self.profile_combo.itemData(index)
+        path = Path(selected) if selected is not None else None
         self._request_profile_switch(path)
 
     def _ask_about_dirty_edits(self) -> str:
         self._update_dirty_state()
-        dirty = self._saved_config_signature is not None and (
+        dirty = self._profile_content_ready and self._saved_config_signature is not None and (
             self._config_signature() != self._saved_config_signature
         )
         if not dirty:
@@ -1017,7 +1322,9 @@ class MainWindow(QMainWindow):
         self.profile_combo.setCurrentIndex(max(0, index))
         self.profile_combo.blockSignals(False)
 
-    def _request_profile_switch(self, path: Path | None) -> None:
+    def _request_profile_switch(
+        self, path: Path | None, *, from_wizard: bool = False
+    ) -> None:
         if self._profile_action_in_progress() or self._import_action_in_progress():
             self._restore_profile_combo()
             return
@@ -1027,35 +1334,60 @@ class MainWindow(QMainWindow):
             return
         if choice == "save":
             self._pending_profile_switch = path
+            self._pending_profile_switch_active = True
+            self._pending_profile_switch_from_wizard = from_wizard
             self.save_config()
             if self._pending_profile_request is None:
                 self._pending_profile_switch = None
+                self._pending_profile_switch_active = False
+                self._pending_profile_switch_from_wizard = False
                 self._restore_profile_combo()
             return
-        self._queue_config_load(path)
+        self._queue_config_load(path, from_wizard=from_wizard)
 
     def _load_existing_from_wizard(self) -> None:
-        self.choose_config_to_load()
+        self.choose_config_to_load(from_wizard=True)
 
-    def open_onboarding(self) -> None:
+    def open_onboarding(self, *, new_profile: bool = False) -> None:
         from .onboarding import OnboardingDraft, OnboardingWizard
 
         if self._wizard is not None and self._wizard.isVisible():
             self._wizard.raise_()
             self._wizard.activateWindow()
             return
+        if not new_profile and not self._profile_content_ready:
+            self.status_label.setText(
+                "当前配置尚未载入；请先载入配置，或新建配置。"
+            )
+            return
         self._stop_before_profile_dialog("首次设置向导")
-        draft = OnboardingDraft(
-            self.identity,
-            self.geometry,
-            self.settings,
-            self.region,
-            self.button,
-            self.success,
-            original_region=self.region,
-            original_button=self.button,
-            original_success=self.success,
-        )
+        if new_profile:
+            draft = OnboardingDraft(
+                self.identity,
+                self.geometry,
+                Settings(),
+                Region(),
+                None,
+                None,
+                profile_name="新建配置",
+                game_label="",
+                edit_current=False,
+            )
+        else:
+            draft = OnboardingDraft(
+                self.identity,
+                self.geometry,
+                self.settings,
+                self.region,
+                self.button,
+                self.success,
+                original_region=self.region,
+                original_button=self.button,
+                original_success=self.success,
+                profile_name=self._current_profile_metadata.name,
+                game_label=self._current_profile_metadata.game,
+                edit_current=True,
+            )
         self._wizard = OnboardingWizard(draft, self)
         self._wizard.setModal(True)
         self._wizard.targetsRequested.connect(self._wizard_refresh_targets)
@@ -1078,6 +1410,8 @@ class MainWindow(QMainWindow):
 
     def _queue_wizard(self, action: str, payload: Any, label: str) -> None:
         if self._wizard_request is not None:
+            if action == "wizard_save" and self._wizard is not None:
+                self._wizard.save_failed("后台检查仍在处理，请完成后重试保存。")
             return
         request_id = self.worker.submit(action, payload)
         if request_id is None:
@@ -1167,44 +1501,67 @@ class MainWindow(QMainWindow):
             "正在获取新画面并运行生产识别…",
         )
 
-    def _wizard_finish(self, draft: Any, name: str) -> None:
+    def _wizard_finish(self, draft: Any, metadata: ProfileMetadata) -> None:
         if self._wizard is None or draft is not self._wizard.draft:
             return
-        safe_name = name.strip()
-        has_invalid_character = any(
-            ord(character) < 32 or character in '<>:"/\\|?*'
-            for character in safe_name
-        )
-        if not safe_name or Path(safe_name).name != safe_name or has_invalid_character:
-            self._wizard.save_failed("配置名称包含不支持的文件名字符。")
+        if self._wizard_request is not None:
+            self._wizard.save_failed("后台检查仍在处理，请完成后重试保存。")
             return
         try:
+            metadata.validate()
+            if not metadata.name.strip():
+                raise ValueError("请输入配置名称。")
+            if draft.edit_current and not self._profile_content_ready:
+                raise ValueError("当前配置尚未载入，无法编辑保存。")
             draft.settings.validate()
             draft.region.validate()
             if draft.button is None:
                 raise ValueError("请先在画面中框出按钮模板。")
             if draft.geometry is None or not draft.button.compatible(draft.geometry):
-                raise ValueError("按钮模板与所选窗口尺寸或 DPI 不匹配，请重新采图。")
+                raise ValueError(
+                    "按钮模板与所选窗口尺寸或 DPI 不匹配；恢复对应窗口设置或修改模板。"
+                )
             if draft.success is not None and not draft.success.compatible(draft.geometry):
-                raise ValueError("成功标志与所选窗口尺寸或 DPI 不匹配。")
+                raise ValueError(
+                    "成功标志与所选窗口尺寸或 DPI 不匹配；恢复对应窗口设置或修改模板。"
+                )
         except (AttributeError, ValueError) as exc:
             self._wizard.save_failed(f"草稿无效：{exc}")
             return
-        path = Path(self.store.root) / f"{safe_name}.json"
+        if draft.edit_current:
+            path = self._current_config_path or getattr(self.store, "config_path", None)
+            if path is None:
+                self._wizard.save_failed("当前配置路径不可用，无法编辑保存。")
+                return
+            path = Path(path)
+            intent = "edit"
+        else:
+            root = getattr(self.store, "root", None)
+            if root is None:
+                self._wizard.save_failed("配置存储目录不可用，无法新建配置。")
+                return
+            safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", metadata.name).strip(" .")
+            if not safe_name:
+                safe_name = "配置"
+            path = Path(root) / f"{safe_name}.json"
+            intent = "new"
         self._wizard_save_path = path
+        submitted_draft = _snapshot_onboarding_draft(draft)
         self._queue_wizard(
             "wizard_save",
-            (path, draft.settings, draft.region, draft.button, draft.success),
-            "正在保存向导草稿…",
+            (intent, path, submitted_draft, metadata),
+            "正在保存当前配置…" if intent == "edit" else "正在新建配置…",
         )
 
-    def _commit_wizard_draft(self, path: Path | None) -> None:
+    def _commit_wizard_draft(
+        self, path: Path | None, draft: Any, metadata: ProfileMetadata
+    ) -> None:
         if self._wizard is None:
             return
         wizard = self._wizard
-        draft = wizard.draft
         self._invalidate_semantics()
         self.engine.stop("首次设置已保存；本轮未开始")
+        previous_hotkey = self.settings.hotkey
         self.settings = draft.settings
         self.region = draft.region
         self.button = draft.button
@@ -1212,12 +1569,15 @@ class MainWindow(QMainWindow):
         self.identity = draft.identity
         self.geometry = draft.geometry
         self._static_frame = draft.frame
+        self._profile_content_ready = True
+        self._profile_content_error = ""
         self.mode = Mode.REMIND
         self.mode_combo.blockSignals(True)
         self.mode_combo.setCurrentIndex(0)
         self.mode_combo.blockSignals(False)
         self._apply_settings_widgets()
-        self._install_hotkey()
+        if self.settings.hotkey != previous_hotkey:
+            self._install_hotkey()
         if self.identity is not None:
             index = self.target_combo.findData(self.identity)
             if index >= 0:
@@ -1236,7 +1596,9 @@ class MainWindow(QMainWindow):
         self._set_current_config_path(
             Path(path) if path is not None else Path(default_path) if default_path else None
         )
+        self._set_current_profile_metadata(metadata)
         self._saved_config_signature = self._config_signature()
+        self._refresh_template_preview()
         self._wizard_save_path = None
         wizard.save_succeeded(path)
         self._wizard = None
@@ -1259,27 +1621,101 @@ class MainWindow(QMainWindow):
             self.status_label.setText(label)
         return request_id
 
-    def _update_current_config_label(self) -> None:
-        path = self._current_config_path
-        if path is None:
-            self.current_config_label.setText("当前配置：默认配置")
-            self.current_config_label.setToolTip("使用应用默认配置")
+    def _load_startup_default_profile(self) -> None:
+        if self._startup_default_load_started or self._closed or self._shutdown_started:
+            return
+        self._startup_load_retry_scheduled = False
+        if self._queue_config_load(None, startup=True):
+            self._startup_default_load_started = True
+            return
+        if not self._startup_load_retry_scheduled:
+            self._startup_load_retry_scheduled = True
+            QTimer.singleShot(50, self._load_startup_default_profile)
+
+    def show_template_preview(self) -> None:
+        self._refresh_template_preview()
+        self.template_preview_dialog.show()
+        self.template_preview_dialog.raise_()
+        self.template_preview_dialog.activateWindow()
+
+    def _refresh_template_preview(self) -> None:
+        if not hasattr(self, "button_template_thumbnail"):
+            return
+        dirty = self._profile_content_ready and self._saved_config_signature is not None and (
+            self._config_signature() != self._saved_config_signature
+        )
+        self.button_template_thumbnail.set_template(self.button)
+        self.success_template_thumbnail.set_template(self.success)
+        if not self._profile_content_ready:
+            state = "载入失败" if self._profile_content_error else "尚未载入"
+            self.button_template_status.setText(f"按钮模板：{state}")
+            self.success_template_status.setText(f"成功标志：{state}")
         else:
-            self.current_config_label.setText(f"当前配置：{path.name}")
-            self.current_config_label.setToolTip(str(path))
+            self.button_template_status.setText(
+                "按钮模板：已设置" if self.button is not None else "按钮模板：未设置"
+            )
+            self.success_template_status.setText(
+                "成功标志：已设置" if self.success is not None else "成功标志：未设置（可选）"
+            )
+        self.button_template_status.setToolTip(
+            "当前配置有未保存修改" if dirty else "当前配置已保存"
+        )
+        self.success_template_status.setToolTip(
+            "当前配置有未保存修改" if dirty else "当前配置已保存"
+        )
+        self.template_preview_dialog.set_templates(
+            self.button,
+            self.success,
+            self.geometry,
+            loaded=self._profile_content_ready,
+            dirty=dirty,
+            load_error=self._profile_content_error,
+        )
+
+    def _update_current_config_label(self, *, dirty: bool | None = None) -> None:
+        if not hasattr(self, "current_config_label"):
+            return
+        path = self._current_config_path
+        if dirty is None:
+            dirty = self._profile_content_ready and self._saved_config_signature is not None and (
+                self._config_signature() != self._saved_config_signature
+            )
+        metadata = self._current_profile_metadata
+        label = f"当前配置：{metadata.name}\n对应游戏：{metadata.game}"
+        if dirty:
+            label += " · 未保存修改"
+        self.current_config_label.setText(label)
+        self.current_config_label.setTextFormat(Qt.TextFormat.PlainText)
+        default_path = getattr(self.store, "config_path", None)
+        tooltip_path = path if path is not None else default_path
+        self.current_config_label.setToolTip(
+            str(tooltip_path) if tooltip_path is not None else "使用应用默认配置"
+        )
         if hasattr(self, "profile_combo"):
-            default_path = getattr(self.store, "config_path", None)
             if (path is None or (default_path is not None
                     and Path(path).resolve() == Path(default_path).resolve())):
                 index = self.profile_combo.findData(None)
             else:
                 index = self._profile_combo_index(path)
                 if index < 0:
-                    self.profile_combo.addItem(path.stem, path)
+                    self.profile_combo.addItem(self._profile_display_name(metadata), path)
                     index = self.profile_combo.count() - 1
+                    self.profile_combo.setItemData(
+                        index, str(path), Qt.ItemDataRole.ToolTipRole
+                    )
             self.profile_combo.blockSignals(True)
             self.profile_combo.setCurrentIndex(max(0, index))
             self.profile_combo.blockSignals(False)
+
+    @staticmethod
+    def _profile_display_name(metadata: ProfileMetadata) -> str:
+        return f"{metadata.game} · {metadata.name}"
+
+    def _set_current_profile_metadata(self, metadata: ProfileMetadata) -> None:
+        metadata.validate()
+        self._current_profile_metadata = metadata
+        self._current_profile_metadata_initialized = True
+        self._update_current_config_label()
 
     def _set_current_config_path(self, path: Path | None) -> None:
         self._current_config_path = Path(path) if path is not None else None
@@ -1303,9 +1739,15 @@ class MainWindow(QMainWindow):
         if request_id is None:
             if action == "load_config":
                 self._config_loading = False
-            if self._pending_profile_switch is not None:
+                self.status_label.setText(
+                    "后台队列繁忙，未载入所选配置；当前配置保持不变。"
+                )
+                self._loading_from_wizard = False
+            if self._pending_profile_switch_active:
                 self._pending_profile_switch = None
-                self._restore_profile_combo()
+                self._pending_profile_switch_active = False
+                self._pending_profile_switch_from_wizard = False
+            self._restore_profile_combo()
             self._update_controls()
             return
         self._pending_profile_request = request_id
@@ -1317,6 +1759,8 @@ class MainWindow(QMainWindow):
         self.engine.stop(reason)
 
     def _invalidate_semantics(self) -> None:
+        self._start_failure_key = None
+        self._start_failure_message = ""
         self.worker.invalidate_authorization()
         self._semantic_revision += 1
         self.worker.set_semantic_revision(self._semantic_revision)
@@ -1354,6 +1798,7 @@ class MainWindow(QMainWindow):
         self._static_frame = None
         self.preview.set_frame(None)
         self.selection_combo.setCurrentIndex(0)
+        self._refresh_template_preview()
         if self.identity is None:
             self.target_info.setText("未选择目标；配置文件不会保存窗口绑定。")
             self.target_summary_label.setText("每次启动都需要重新确认窗口。")
@@ -1450,6 +1895,7 @@ class MainWindow(QMainWindow):
                 self.success = None
             self._configure_engine(f"框选无效：{exc}")
             self.status_label.setText(f"框选无效：{exc}")
+            self._refresh_template_preview()
             self._update_controls()
 
     def _template_summary(self) -> str:
@@ -1458,6 +1904,22 @@ class MainWindow(QMainWindow):
                   f"{self.region.width:.2f} × {self.region.height:.2f}",
                   f"成功标志：{'已设置' if self.success else '未设置'}"]
         return "；".join(pieces)
+
+    def _templates_match_current_target(self) -> bool:
+        return (
+            self.identity is not None
+            and self.geometry is not None
+            and self.button is not None
+            and self.button.compatible(self.geometry)
+            and (self.success is None or self.success.compatible(self.geometry))
+        )
+
+    def _template_compatibility_message(self) -> str:
+        if self.button is None:
+            return "先设置按钮模板。"
+        if self.identity is None or self.geometry is None:
+            return "模板已载入，无需重复框选；请选择本次目标窗口。"
+        return "模板保留；恢复窗口尺寸/DPI或修改模板。"
 
     def _configure_engine(self, reason: str = "设置已更改") -> bool:
         try:
@@ -1568,18 +2030,32 @@ class MainWindow(QMainWindow):
         if self.identity is None or self.button is None:
             self.status_label.setText("先选择目标窗口并框选按钮模板。")
             return
+        if not self._profile_content_ready:
+            self.status_label.setText("当前配置尚未载入；请先载入或新建配置。")
+            return
+        if not self._templates_match_current_target():
+            self.status_label.setText(self._template_compatibility_message())
+            return
         self._invalidate_semantics()
         if not self._configure_engine("无点击预览会取消当前轮"):
             return
         self._queue("preview", self._semantic_revision, "正在进行无点击识别预览…")
 
     def start_round(self) -> None:
+        self._start_failure_key = None
+        self._start_failure_message = ""
         if (self._pending_capture_request is not None or self._pending_import_request is not None
                 or self._config_loading):
             self.status_label.setText("请先等待采集、模板导入或配置载入完成。")
             return
+        if not self._profile_content_ready:
+            self.status_label.setText("当前配置尚未载入；请先载入或新建配置。")
+            return
         if self.identity is None or self.button is None:
             self.status_label.setText("先选择目标窗口并框选按钮模板。")
+            return
+        if not self._templates_match_current_target():
+            self.status_label.setText(self._template_compatibility_message())
             return
         if self.selection_combo.currentData() is not None:
             self.selection_combo.setCurrentIndex(0)
@@ -1643,18 +2119,50 @@ class MainWindow(QMainWindow):
         else:
             self.pause_round()
 
-    def save_config(self) -> None:
+    def _edit_profile_metadata(
+        self, title: str, description: str, initial: ProfileMetadata
+    ) -> ProfileMetadata | None:
+        dialog = ProfileMetadataDialog(initial, title, description, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.metadata()
+
+    def rename_profile(self) -> None:
+        if self._profile_action_in_progress() or self._import_action_in_progress():
+            return
+        if not self._profile_content_ready:
+            self.status_label.setText("当前配置尚未载入，不能重命名；请先载入或新建配置。")
+            return
+        self._stop_before_profile_dialog("重命名配置")
+        metadata = self._edit_profile_metadata(
+            "重命名配置",
+            "保存后会将名称、游戏标签和当前配置一起写入当前配置文件。",
+            self._current_profile_metadata,
+        )
+        if metadata is None:
+            self.status_label.setText("已取消重命名；本轮保持停止。")
+            return
+        self.save_config(metadata=metadata)
+
+    def save_config(self, *, metadata: ProfileMetadata | None = None) -> None:
         if self._profile_action_in_progress():
             return
         if self._import_action_in_progress():
             return
+        if not self._profile_content_ready:
+            self.status_label.setText("当前配置尚未载入，不能保存；请先载入或新建配置。")
+            return
+        metadata = metadata or self._current_profile_metadata
         try:
+            metadata.validate()
+            if not metadata.name.strip():
+                raise ValueError("请输入配置名称。")
             self.settings.validate()
             self.region.validate()
             self._queue_profile_action(
                 "save_config",
                 (self._current_config_path, self._semantic_revision, self.settings,
-                 self.region, self.button, self.success),
+                 self.region, self.button, self.success, metadata),
                 "正在保存当前配置…",
             )
         except ValueError as exc:
@@ -1665,7 +2173,18 @@ class MainWindow(QMainWindow):
             return
         if self._import_action_in_progress():
             return
+        if not self._profile_content_ready:
+            self.status_label.setText("当前配置尚未载入，不能另存；请先载入或新建配置。")
+            return
         self._stop_before_profile_dialog("另存为配置")
+        metadata = self._edit_profile_metadata(
+            "另存为配置",
+            "保存时会将名称、游戏标签和当前配置一起写入新文件。",
+            self._current_profile_metadata,
+        )
+        if metadata is None:
+            self.status_label.setText("已取消另存为；本轮保持停止。")
+            return
         default_path = self._current_config_path or getattr(self.store, "config_path", None)
         default_name = str(default_path) if default_path is not None else ""
         path, _ = QFileDialog.getSaveFileName(
@@ -1674,27 +2193,43 @@ class MainWindow(QMainWindow):
         if not path:
             self.status_label.setText("已取消另存为；本轮保持停止。")
             return
-        self._save_config_to_path(Path(path))
+        self._save_config_to_path(Path(path), metadata)
 
-    def _save_config_to_path(self, path: Path) -> None:
+    def _save_config_to_path(self, path: Path, metadata: ProfileMetadata) -> None:
+        if not self._profile_content_ready:
+            self.status_label.setText("当前配置尚未载入，不能另存；请先载入或新建配置。")
+            return
         try:
+            metadata.validate()
+            if not metadata.name.strip():
+                raise ValueError("请输入配置名称。")
             self.settings.validate()
             self.region.validate()
             self._queue_profile_action(
                 "save_config_as",
                 (Path(path), self._semantic_revision, self.settings, self.region,
-                 self.button, self.success),
+                 self.button, self.success, metadata),
                 "正在保存配置快照…",
             )
         except ValueError as exc:
             self.status_label.setText(f"配置无效：{exc}")
 
-    def choose_config_to_load(self) -> None:
+    def choose_config_to_load(self, *, from_wizard: bool = False) -> None:
         if self._profile_action_in_progress():
             return
         if self._import_action_in_progress():
             return
         self._stop_before_profile_dialog("选择要载入的配置")
+        if self._known_profiles:
+            dialog = ProfileSelectionDialog(self._profile_choices(), self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                self.status_label.setText("已取消载入配置选择；本轮保持停止。")
+                return
+            if dialog.choice is not None:
+                self._request_profile_switch(dialog.choice.path, from_wizard=from_wizard)
+                return
+            if not dialog.browse_requested:
+                return
         current_path = self._current_config_path or getattr(self.store, "config_path", None)
         start_directory = str(current_path.parent) if current_path is not None else ""
         path, _ = QFileDialog.getOpenFileName(
@@ -1703,7 +2238,7 @@ class MainWindow(QMainWindow):
         if not path:
             self.status_label.setText("已取消载入配置选择；本轮保持停止。")
             return
-        self._request_profile_switch(Path(path))
+        self._request_profile_switch(Path(path), from_wizard=from_wizard)
 
     def load_config(self, path: Path | None = None) -> None:
         """Load the default configuration or an explicitly selected profile."""
@@ -1714,14 +2249,28 @@ class MainWindow(QMainWindow):
         self._stop_before_profile_dialog("载入配置")
         self._request_profile_switch(Path(path) if path is not None else None)
 
-    def _queue_config_load(self, path: Path | None) -> None:
+    def _queue_config_load(
+        self, path: Path | None, *, from_wizard: bool = False, startup: bool = False
+    ) -> bool:
         self._stop_before_profile_dialog("载入配置")
+        self._pending_profile_switch = Path(path) if path is not None else None
+        self._pending_profile_switch_active = True
+        self._pending_profile_switch_from_wizard = from_wizard
         self._config_loading = True
         self._update_controls()
         self._queue_profile_action(
             "load_config", (Path(path) if path is not None else None,
                             self._semantic_revision), "正在载入配置…"
         )
+        accepted = self._pending_profile_request is not None
+        if accepted:
+            self._loading_from_wizard = from_wizard
+        else:
+            self._pending_profile_switch_from_wizard = False
+            if startup:
+                self._config_loading = False
+                self._update_controls()
+        return accepted
 
     def import_template(self) -> None:
         if self._profile_action_in_progress():
@@ -1775,20 +2324,35 @@ class MainWindow(QMainWindow):
             widget.blockSignals(False)
 
     def _apply_loaded_config(self, value: Any, path: Path | None) -> None:
+        settings, region, button, success, metadata = value
+        default_path = getattr(self.store, "config_path", None)
+        metadata_path = Path(path) if path is not None else (
+            Path(default_path) if default_path is not None else None
+        )
+        metadata = _display_profile_metadata(
+            metadata, metadata_path, Path(default_path) if default_path is not None else None
+        )
+        self._pending_profile_switch = None
+        self._pending_profile_switch_active = False
+        self._pending_profile_switch_from_wizard = False
         self._invalidate_semantics()
         self._config_loading = False
-        settings, region, button, success = value
+        self._profile_content_ready = True
+        self._profile_content_error = ""
         self.engine.stop("配置已载入；需要手动预览或开始")
+        previous_hotkey = self.settings.hotkey
         self.settings, self.region, self.button, self.success = settings, region, button, success
         self.mode = Mode.REMIND
         self.mode_combo.blockSignals(True)
         self.mode_combo.setCurrentIndex(0)
         self.mode_combo.blockSignals(False)
         self._apply_settings_widgets()
-        self._install_hotkey()
+        if self.settings.hotkey != previous_hotkey:
+            self._install_hotkey()
         # Loading never selects a target or starts a round. A target selected this launch
         # remains explicitly selected, but the loaded templates are only configured for it.
         self._configure_engine("配置已载入；请手动预览并开始")
+        self._update_target_info(self.geometry)
         if path is None:
             default_path = getattr(self.store, "config_path", None)
             self._set_current_config_path(
@@ -1796,9 +2360,17 @@ class MainWindow(QMainWindow):
             )
         else:
             self._set_current_config_path(path)
+        self._set_current_profile_metadata(metadata)
         self._saved_config_signature = self._config_signature()
         self._update_dirty_state()
         self.status_label.setText("配置已载入；本轮未启用，请检查模板后手动预览并开始。")
+        if self._loading_from_wizard and self._wizard is not None:
+            wizard = self._wizard
+            self._loading_from_wizard = False
+            wizard.reject()
+            self.status_label.setText("已载入所选配置；向导草稿已关闭，本轮未启用。")
+        else:
+            self._loading_from_wizard = False
         self._update_controls()
 
     def _handle_result(self, result: _WorkerResult) -> None:
@@ -1810,10 +2382,17 @@ class MainWindow(QMainWindow):
                 self._pending_profile_request = None
                 self._pending_profile_action = None
                 self._pending_profile_switch = None
+                self._pending_profile_switch_active = False
+                self._pending_profile_switch_from_wizard = False
                 if action == "load_config":
                     self._config_loading = False
+                    self._loading_from_wizard = False
+                    if not self._profile_content_ready:
+                        self._profile_content_error = result.error
+                    self._refresh_profiles()
                 self.status_label.setText(f"后台操作失败：{result.error}")
                 self._restore_profile_combo()
+                self._update_dirty_state()
                 self._update_controls()
                 return
             if result.action.startswith("wizard_"):
@@ -1859,7 +2438,10 @@ class MainWindow(QMainWindow):
                 return
             if result.action == "start" and result.request_id == self._pending_start_request:
                 self._pending_start_request = None
-                self.status_label.setText(f"无法开始：{result.error}")
+                snapshot = self.engine.snapshot()
+                self._start_failure_key = (snapshot.state, snapshot.reason)
+                self._start_failure_message = f"无法开始：{result.error}"
+                self.status_label.setText(self._start_failure_message)
                 self._update_controls()
                 return
             if result.action != "tick":
@@ -1867,26 +2449,7 @@ class MainWindow(QMainWindow):
             return
         value = result.value
         if result.action == "list_profiles":
-            self.profile_combo.blockSignals(True)
-            self.profile_combo.clear()
-            self.profile_combo.addItem("默认配置", None)
-            default_path = getattr(self.store, "config_path", None)
-            for path, stem in value:
-                path = Path(path)
-                if default_path is not None and path == Path(default_path).resolve():
-                    continue
-                self.profile_combo.addItem(stem, path)
-            current = self._current_config_path
-            if (current is None or (default_path is not None
-                    and Path(current).resolve() == Path(default_path).resolve())):
-                index = self.profile_combo.findData(None)
-            else:
-                index = self._profile_combo_index(current)
-                if index < 0:
-                    self.profile_combo.addItem(current.stem, current)
-                    index = self.profile_combo.count() - 1
-            self.profile_combo.setCurrentIndex(max(0, index))
-            self.profile_combo.blockSignals(False)
+            self._populate_profile_combo(value)
         elif result.action == "wizard_targets":
             if self._wizard is None or result.request_id != self._wizard_request:
                 return
@@ -1934,7 +2497,10 @@ class MainWindow(QMainWindow):
                 return
             self._wizard_request = None
             self._wizard_action = None
-            self._commit_wizard_draft(Path(value) if value is not None else None)
+            _intent, path, draft, metadata = value
+            self._commit_wizard_draft(
+                Path(path) if path is not None else None, draft, metadata
+            )
         elif result.action == "refresh_targets":
             self._refreshing_targets = False
             current = self.identity
@@ -1965,6 +2531,7 @@ class MainWindow(QMainWindow):
                 )
                 self.preview.set_frame(None)
                 self.target_info.setText("未选择目标；请重新明确选择窗口。")
+                self._refresh_template_preview()
                 self.engine.stop("窗口列表已刷新")
                 self._update_controls()
             elif available:
@@ -1977,6 +2544,7 @@ class MainWindow(QMainWindow):
                 return
             self.geometry = geometry
             self._update_target_info(geometry)
+            self._refresh_template_preview()
             self._update_controls()
         elif result.action == "capture":
             if result.request_id != self._pending_capture_request:
@@ -1994,15 +2562,23 @@ class MainWindow(QMainWindow):
             self._capture_clears_selections = False
             if previous is not None and previous.template_key != geometry.template_key:
                 self.region = Region()
-            if self.button is not None and not self.button.compatible(geometry):
-                self.button = None
-            if self.success is not None and not self.success.compatible(geometry):
-                self.success = None
             self._static_frame = frame
             self.geometry = geometry
             self.preview.set_frame(frame)
             self._update_target_info(geometry)
-            self.status_label.setText("截图仅保存在内存；请选择按钮模板、搜索区域或成功标志进行框选。")
+            if self.button is not None and not self.button.compatible(geometry):
+                self.status_label.setText(
+                    "静态截图已更新；模板保留但与当前窗口尺寸或 DPI 不匹配。"
+                    "恢复对应窗口设置或修改模板。"
+                )
+            elif self.button is not None:
+                self.status_label.setText(
+                    "静态截图已更新；现有按钮模板与当前窗口匹配，无需重复框选。"
+                )
+            else:
+                self.status_label.setText(
+                    "截图仅保存在内存；请选择按钮模板、搜索区域或成功标志进行框选。"
+                )
             self._update_dirty_state()
             self._update_controls()
         elif result.action == "preview":
@@ -2036,45 +2612,67 @@ class MainWindow(QMainWindow):
                 revision, path, config = value
                 if revision == self._semantic_revision:
                     self._apply_loaded_config(config, path)
+                    self._refresh_profiles()
                 else:
+                    self._pending_profile_switch = None
+                    self._pending_profile_switch_active = False
+                    self._pending_profile_switch_from_wizard = False
                     self._config_loading = False
+                    self._loading_from_wizard = False
                     self.status_label.setText("载入结果已作废，因为你随后更改了设置。")
+                    self._restore_profile_combo()
+                    self._update_dirty_state()
+                    self._refresh_profiles()
                     self._update_controls()
             elif action == "save_config_as":
-                path, revision = value
+                path, revision, metadata = value
                 if revision == self._semantic_revision:
                     self._set_current_config_path(path)
+                    self._set_current_profile_metadata(metadata)
                     self._saved_config_signature = self._config_signature()
                     self._update_dirty_state()
                     self.status_label.setText("配置和模板已另存；本轮保持停止。")
-                    self._refresh_profiles()
-                    if self._pending_profile_switch is not None:
+                    if self._pending_profile_switch_active:
                         switch_path = self._pending_profile_switch
+                        from_wizard = self._pending_profile_switch_from_wizard
                         self._pending_profile_switch = None
-                        self._queue_config_load(switch_path)
+                        self._pending_profile_switch_active = False
+                        self._pending_profile_switch_from_wizard = False
+                        self._queue_config_load(switch_path, from_wizard=from_wizard)
+                    else:
+                        self._refresh_profiles()
                 else:
                     self.status_label.setText(
                         "已保存选择时的配置快照；设置随后已更改，当前配置位置未切换。"
                     )
-                    if self._pending_profile_switch is not None:
+                    if self._pending_profile_switch_active:
                         self._pending_profile_switch = None
+                        self._pending_profile_switch_active = False
+                        self._pending_profile_switch_from_wizard = False
                         self._restore_profile_combo()
                 self._update_controls()
             else:
-                _path, revision = value
+                _path, revision, metadata = value
                 if revision == self._semantic_revision:
+                    self._set_current_profile_metadata(metadata)
                     self._saved_config_signature = self._config_signature()
                     self._update_dirty_state()
                     self.status_label.setText("当前配置和模板已保存。")
-                    self._refresh_profiles()
-                    if self._pending_profile_switch is not None:
+                    if self._pending_profile_switch_active:
                         switch_path = self._pending_profile_switch
+                        from_wizard = self._pending_profile_switch_from_wizard
                         self._pending_profile_switch = None
-                        self._queue_config_load(switch_path)
+                        self._pending_profile_switch_active = False
+                        self._pending_profile_switch_from_wizard = False
+                        self._queue_config_load(switch_path, from_wizard=from_wizard)
+                    else:
+                        self._refresh_profiles()
                 else:
                     self.status_label.setText("已保存配置快照；设置随后已更改。")
-                    if self._pending_profile_switch is not None:
+                    if self._pending_profile_switch_active:
                         self._pending_profile_switch = None
+                        self._pending_profile_switch_active = False
+                        self._pending_profile_switch_from_wizard = False
                         self._restore_profile_combo()
                 self._update_controls()
         elif result.action == "import_template":
@@ -2091,6 +2689,7 @@ class MainWindow(QMainWindow):
                 self.success = template
             self._configure_engine("模板已导入，当前轮已取消")
             self.status_label.setText(f"已导入模板：{template.name}；请先进行无点击预览。")
+            self._update_dirty_state()
             self._update_controls()
         else:
             self.status_label.setText(str(value))
@@ -2115,7 +2714,8 @@ class MainWindow(QMainWindow):
             )
             if incompatible:
                 self.target_info.setText(
-                    self.target_info.text() + " · 已载入模板与此窗口尺寸或 DPI 不匹配，请重新采集"
+                    self.target_info.text()
+                    + " · 模板保留；恢复窗口尺寸/DPI或修改模板"
                 )
 
     def _refresh_worker_state(self) -> None:
@@ -2162,7 +2762,13 @@ class MainWindow(QMainWindow):
         state_text = self._state_summary(snapshot)
         self.state_label.setText(state_text)
         status_key = (snapshot.state, snapshot.reason)
-        if status_key != self._last_dashboard_status:
+        if self._start_failure_message:
+            self._last_dashboard_status = status_key
+            if status_key == self._start_failure_key:
+                self.status_label.setText(self._start_failure_message)
+                self._start_failure_key = None
+                self._start_failure_message = ""
+        elif status_key != self._last_dashboard_status:
             self.status_label.setText(self._reason_and_next_step(snapshot))
             self._last_dashboard_status = status_key
         if snapshot.capture_status is not None:
@@ -2272,6 +2878,7 @@ class MainWindow(QMainWindow):
                       and self.button.compatible(self.geometry)
                       and (self.success is None or self.success.compatible(self.geometry)))
         ready = (has_target and compatible and not self._config_loading
+                 and self._profile_content_ready
                  and self._pending_capture_request is None
                  and self._pending_import_request is None
                  and not self._refreshing_targets)
@@ -2310,17 +2917,26 @@ class MainWindow(QMainWindow):
             and self._pending_start_request is None
         )
         self.onboarding_button.setText(
-            "编辑配置" if self.button is not None else "开始设置"
+            "修改当前配置…" if self.button is not None else "设置当前配置"
         )
         self.onboarding_button.setEnabled(
-            self._pending_profile_request is None and self._pending_capture_request is None
+            self._profile_content_ready and not self._config_loading
+            and self._pending_profile_request is None
+            and self._pending_capture_request is None
         )
         profile_available = (self._pending_profile_request is None
-                             and self._pending_import_request is None)
-        self.save_button.setEnabled(profile_available)
+                             and self._pending_import_request is None
+                             and not self._config_loading)
+        current_write_allowed = self._profile_content_ready and profile_available
+        self.save_button.setEnabled(current_write_allowed)
         self.load_button.setEnabled(profile_available)
-        self.save_as_button.setEnabled(profile_available)
-        self.import_button.setEnabled(self.geometry is not None and
+        self.save_as_button.setEnabled(current_write_allowed)
+        self.rename_profile_button.setEnabled(current_write_allowed)
+        self.load_profile_dashboard_button.setEnabled(profile_available)
+        self.save_as_dashboard_button.setEnabled(current_write_allowed)
+        self.new_profile_button.setEnabled(profile_available)
+        self.profile_combo.setEnabled(profile_available)
+        self.import_button.setEnabled(self._profile_content_ready and self.geometry is not None and
                                       self._pending_import_request is None and
                                       self._pending_profile_request is None)
 

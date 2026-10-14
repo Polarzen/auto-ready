@@ -24,7 +24,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .config import ProfileMetadata
 from .models import Detection, Geometry, Identity, Region, Settings, Template
+from .template_preview import TemplateThumbnail
 
 
 @dataclass
@@ -41,6 +43,9 @@ class OnboardingDraft:
     original_region: Region | None = None
     original_button: Template | None = None
     original_success: Template | None = None
+    profile_name: str = "我的配置"
+    game_label: str = ""
+    edit_current: bool = False
 
 
 class OnboardingWizard(QDialog):
@@ -51,14 +56,15 @@ class OnboardingWizard(QDialog):
     draftChanged = Signal()
     captureRequested = Signal(object)
     recognitionRequested = Signal(object)
-    finishRequested = Signal(object, str)
+    finishRequested = Signal(object, object)
     loadProfileRequested = Signal()
 
     def __init__(self, draft: OnboardingDraft, parent: QWidget | None = None):
         super().__init__(parent)
         self.draft = draft
         self._saving = False
-        self.setWindowTitle("首次设置")
+        self._game_user_edited = draft.edit_current
+        self.setWindowTitle("修改当前配置" if draft.edit_current else "新建配置")
         self.setMinimumSize(520, 360)
 
         outer = QVBoxLayout(self)
@@ -121,6 +127,21 @@ class OnboardingWizard(QDialog):
         self.capture_guidance = QLabel()
         self.capture_guidance.setWordWrap(True)
         layout.addWidget(self.capture_guidance)
+        retained_row = QHBoxLayout()
+        self.retained_button_preview = TemplateThumbnail(140, 76, page)
+        self.retained_success_preview = TemplateThumbnail(140, 76, page)
+        retained_status = QVBoxLayout()
+        self.button_feedback = QLabel()
+        self.button_feedback.setWordWrap(True)
+        self.success_feedback = QLabel()
+        self.success_feedback.setWordWrap(True)
+        retained_status.addWidget(self.button_feedback)
+        retained_status.addWidget(self.success_feedback)
+        retained_status.addStretch(1)
+        retained_row.addWidget(self.retained_button_preview)
+        retained_row.addWidget(self.retained_success_preview)
+        retained_row.addLayout(retained_status, 1)
+        layout.addLayout(retained_row)
         row = QHBoxLayout()
         self.capture_button = QPushButton("获取静态画面")
         self.capture_button.clicked.connect(self._request_capture)
@@ -146,10 +167,8 @@ class OnboardingWizard(QDialog):
         self.preview.setMinimumSize(480, 280)
         self.preview.selectionMade.connect(self._selection_made)
         layout.addWidget(self.preview, 1)
-        self.button_feedback = QLabel("尚未框选按钮。")
-        self.button_feedback.setWordWrap(True)
-        layout.addWidget(self.button_feedback)
         self.pages.addWidget(page)
+        self._refresh_template_feedback()
 
     def _build_check_page(self) -> None:
         page = QWidget()
@@ -169,7 +188,26 @@ class OnboardingWizard(QDialog):
         layout.addWidget(QLabel("命名配置，然后明确保存。完成设置不会开始监控。"))
         self.name_edit = QLineEdit("我的配置")
         self.name_edit.setPlaceholderText("配置名称")
+        self.name_edit.setMaxLength(80)
+        self.name_edit.setText(self.draft.profile_name)
+        self.name_label = QLabel("配置名称（必填）")
+        layout.addWidget(self.name_label)
+        self.name_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.name_edit)
+        self.game_edit = QLineEdit(self.draft.game_label)
+        self.game_edit.setMaxLength(80)
+        self.game_edit.setPlaceholderText("游戏名称（可选）")
+        self.game_edit.textEdited.connect(self._game_label_edited)
+        self.game_label = QLabel("对应游戏")
+        self.game_label.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.game_label)
+        layout.addWidget(self.game_edit)
+        self.game_guidance = QLabel(
+            "游戏名称只是方便识别配置的标签，不会选择或绑定游戏窗口。"
+        )
+        self.game_guidance.setWordWrap(True)
+        self.game_guidance.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.game_guidance)
         self.save_feedback = QLabel(
             "默认模式为仅提醒。没有成功标志时，只能报告已点击，不能确认结果。"
         )
@@ -179,6 +217,8 @@ class OnboardingWizard(QDialog):
         self.pages.addWidget(page)
 
     def set_targets(self, targets: list[Identity]) -> None:
+        if self._saving:
+            return
         selected = self.draft.identity
         self.target_combo.blockSignals(True)
         self.target_combo.clear()
@@ -195,7 +235,7 @@ class OnboardingWizard(QDialog):
         self._target_changed(self.target_combo.currentIndex())
 
     def set_target_geometry(self, identity: Identity, geometry: Geometry) -> None:
-        if self.draft.identity != identity:
+        if self._saving or self.draft.identity != identity:
             return
         self.draft.geometry = geometry
         index = self.target_combo.findData(identity)
@@ -209,6 +249,8 @@ class OnboardingWizard(QDialog):
             f"已选：{identity.title or Path(identity.executable).name}。"
             f"客户区 {geometry.width}×{geometry.height}，DPI {geometry.dpi}。"
         )
+        self._refresh_template_feedback()
+        self._update_controls()
 
     def set_capture_guidance(self, backend: str, delay_seconds: float) -> None:
         if backend.casefold() in {"gdi", "foreground", "front"}:
@@ -222,11 +264,13 @@ class OnboardingWizard(QDialog):
             )
 
     def set_frame(self, frame: Any) -> None:
+        if self._saving:
+            return
         self.draft.frame = frame
         self.draft.geometry = frame.geometry
         self.preview.set_frame(frame)
         self.preview.set_selection_enabled(True)
-        self.button_feedback.setText("静态画面已就绪；拖动框选完整按钮。")
+        self._refresh_template_feedback()
         self.capture_button.setEnabled(True)
         self.draftChanged.emit()
 
@@ -235,6 +279,8 @@ class OnboardingWizard(QDialog):
         self.button_feedback.setText(f"未更换当前画面或模板：{message}")
 
     def recognition_completed(self, detection: Detection) -> None:
+        if self._saving:
+            return
         if detection.unique is not None:
             self.draft.confirmed = True
             self.draft.recognition_text = "找到一个按钮；仍需你手动开始本轮。"
@@ -270,15 +316,28 @@ class OnboardingWizard(QDialog):
         super().closeEvent(event)
 
     def _target_changed(self, index: int) -> None:
+        if self._saving:
+            return
         identity = self.target_combo.itemData(index)
         self.draft.identity = identity if isinstance(identity, Identity) else None
         self.draft.geometry = None
+        self.draft.frame = None
+        self.preview.set_frame(None)
+        self.preview.set_selection_enabled(False)
         self.target_feedback.setText(
             f"已选：{self.draft.identity.title or Path(self.draft.identity.executable).name}。"
             "正在检查客户区…" if self.draft.identity is not None else "未选择窗口。"
         )
+        if not self._game_user_edited and self.draft.identity is not None:
+            suggestion = self.draft.identity.title.strip()
+            if suggestion:
+                self.game_edit.blockSignals(True)
+                self.game_edit.setText(suggestion[:80])
+                self.game_edit.blockSignals(False)
+                self.draft.game_label = suggestion[:80]
         self.targetChanged.emit(self.draft.identity)
         self.draftChanged.emit()
+        self._refresh_template_feedback()
         self._update_controls()
 
     def _request_capture(self) -> None:
@@ -294,6 +353,8 @@ class OnboardingWizard(QDialog):
         del index
 
     def _selection_made(self, rect: Any) -> None:
+        if self._saving:
+            return
         frame = self.draft.frame
         if frame is None:
             return
@@ -313,26 +374,27 @@ class OnboardingWizard(QDialog):
                 )
                 if kind == "button":
                     self.draft.button = template
-                    self.button_feedback.setText("按钮模板已更新；可以无点击检查识别。")
                 else:
                     self.draft.success = template
-                    self.button_feedback.setText("可选成功标志已更新。")
             else:
                 self.draft.region = Region.from_rect(
                     rect, frame.geometry.width, frame.geometry.height
                 )
                 self.button_feedback.setText("搜索区域已更新。")
             self.draftChanged.emit()
+            self._refresh_template_feedback()
         except (ValueError, IndexError) as exc:
             self.button_feedback.setText(f"框选无效，原模板保留：{exc}")
         self.preview.set_frame(frame)
         self._update_controls()
 
     def undo_selection(self) -> None:
+        if self._saving:
+            return
         self.draft.button = self.draft.original_button
         self.draft.success = self.draft.original_success
         self.draft.region = self.draft.original_region or Region()
-        self.button_feedback.setText("已撤销本次框选；请重新框出按钮。")
+        self._refresh_template_feedback()
         if self.draft.frame is not None:
             self.preview.set_frame(self.draft.frame)
         self.draftChanged.emit()
@@ -342,6 +404,8 @@ class OnboardingWizard(QDialog):
         self.selection_combo.setVisible(shown)
 
     def _request_recognition(self) -> None:
+        if self._saving:
+            return
         if self.draft.identity is None or self.draft.button is None:
             self.recognition_feedback.setText("请先选择窗口并框选按钮。")
             return
@@ -350,17 +414,41 @@ class OnboardingWizard(QDialog):
         self.recognitionRequested.emit(self.draft)
 
     def _request_finish(self) -> None:
-        if self.draft.identity is None or self.draft.button is None:
-            self.save_feedback.setText("请先选择窗口并框选按钮。")
+        if self._saving:
+            return
+        if self.draft.identity is None or self.draft.geometry is None:
+            self.save_feedback.setText("请先选择并检查窗口。")
+            return
+        if self.draft.button is None:
+            self.save_feedback.setText("请先设置按钮模板。")
+            return
+        if not self._templates_compatible():
+            self.save_feedback.setText(
+                "模板与所选窗口尺寸或 DPI 不匹配；请恢复对应窗口设置或修改模板。"
+            )
             return
         name = self.name_edit.text().strip()
         if not name:
             self.save_feedback.setText("请输入配置名称。")
             return
+        metadata = ProfileMetadata(name, self.game_edit.text().strip())
+        try:
+            metadata.validate()
+        except ValueError as exc:
+            self.save_feedback.setText(str(exc))
+            return
+        self.draft.profile_name = metadata.name
+        self.draft.game_label = metadata.game
         self._saving = True
-        self.save_feedback.setText("正在保存配置和模板…")
+        self.save_feedback.setText("正在保存名称、游戏标签、配置和模板…")
         self._update_controls()
-        self.finishRequested.emit(self.draft, name)
+        self.finishRequested.emit(self.draft, metadata)
+
+    def _game_label_edited(self, value: str) -> None:
+        if self._saving:
+            return
+        self._game_user_edited = True
+        self.draft.game_label = value
 
     def next(self) -> None:
         index = self.pages.currentIndex()
@@ -368,7 +456,12 @@ class OnboardingWizard(QDialog):
             self.target_feedback.setText("请先选择并检查一个窗口。")
             return
         if index == 1 and self.draft.button is None:
-            self.button_feedback.setText("请在静态画面中框出按钮；旧模板仍保留在草稿中。")
+            self.button_feedback.setText("请在静态画面中框出按钮模板。")
+            return
+        if index == 1 and not self._templates_compatible():
+            self.button_feedback.setText(
+                "模板已保留，但与所选窗口尺寸或 DPI 不匹配；请恢复对应窗口设置或修改模板。"
+            )
             return
         self._show_step(min(3, index + 1))
 
@@ -383,15 +476,64 @@ class OnboardingWizard(QDialog):
         self.next_button.setVisible(index < 3)
         self.finish_button.setVisible(index == 3)
         if index == 1:
+            self._refresh_template_feedback()
             self._update_controls()
 
+    def _templates_compatible(self) -> bool:
+        geometry = self.draft.geometry
+        return (
+            geometry is not None
+            and self.draft.button is not None
+            and self.draft.button.compatible(geometry)
+            and (self.draft.success is None or self.draft.success.compatible(geometry))
+        )
+
+    def _refresh_template_feedback(self) -> None:
+        button = self.draft.button
+        success = self.draft.success
+        self.retained_button_preview.set_template(button)
+        self.retained_success_preview.set_template(success)
+        if button is None:
+            self.button_feedback.setText("尚未设置按钮模板。")
+        elif self.draft.geometry is None:
+            self.button_feedback.setText(
+                "已保留按钮模板；选择并检查窗口后即可判断是否匹配，无需重新框选。"
+            )
+        elif button.compatible(self.draft.geometry):
+            self.button_feedback.setText(
+                "已保留按钮模板，与所选窗口尺寸和 DPI 匹配；无需重新框选。"
+            )
+        else:
+            self.button_feedback.setText(
+                "按钮模板已保留，但尺寸或 DPI 不匹配；恢复对应窗口设置或修改模板。"
+            )
+        if success is None:
+            self.success_feedback.setText("可选成功标志：未设置。")
+        elif self.draft.geometry is not None and not success.compatible(self.draft.geometry):
+            self.success_feedback.setText(
+                "可选成功标志已保留，但尺寸或 DPI 不匹配。"
+            )
+        else:
+            self.success_feedback.setText("可选成功标志已保留。")
+
     def _update_controls(self) -> None:
+        self.target_combo.setEnabled(not self._saving)
+        self.selection_combo.setEnabled(not self._saving)
+        self.advanced_button.setEnabled(not self._saving)
+        self.name_edit.setEnabled(not self._saving)
+        self.game_edit.setEnabled(not self._saving)
         self.next_button.setEnabled(not self._saving)
         self.back_button.setEnabled(not self._saving)
         self.cancel_button.setEnabled(not self._saving)
         self.finish_button.setEnabled(not self._saving)
-        self.undo_button.setEnabled(self.draft.button is not None or self.draft.success is not None)
+        self.undo_button.setEnabled(
+            not self._saving
+            and (self.draft.button is not None or self.draft.success is not None)
+        )
         self.capture_button.setEnabled(self.draft.identity is not None and not self._saving)
         self.check_button.setEnabled(self.draft.button is not None and not self._saving)
         self.load_profile_button.setEnabled(not self._saving)
         self.refresh_targets_button.setEnabled(not self._saving)
+        self.preview.set_selection_enabled(
+            self.draft.frame is not None and not self._saving
+        )

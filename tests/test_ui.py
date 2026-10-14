@@ -15,7 +15,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QSystemTrayIcon
 
 from auto_ready.app import main
-from auto_ready.config import ConfigStore
+from auto_ready.config import ConfigStore, ProfileMetadata
 from auto_ready.engine import Engine
 from auto_ready.models import (
     Frame,
@@ -28,6 +28,7 @@ from auto_ready.models import (
     State,
     Template,
 )
+from auto_ready.profile_dialogs import ProfileSelectionDialog
 from auto_ready.ui import ImagePreview, MainWindow, _IOWorker, _WorkerResult, close_and_wait
 
 
@@ -35,9 +36,18 @@ from auto_ready.ui import ImagePreview, MainWindow, _IOWorker, _WorkerResult, cl
 def close_main_windows(qtbot):
     windows = []
 
-    def register(window):
+    def register(window, *, wait_for_startup: bool = True):
         qtbot.addWidget(window)
         windows.append(window)
+        if wait_for_startup:
+            qtbot.waitUntil(
+                lambda: (
+                    window._startup_default_load_started
+                    and window._pending_profile_request is None
+                    and not window._config_loading
+                ),
+                timeout=5000,
+            )
         return window
 
     yield register
@@ -111,14 +121,20 @@ class FakeInput:
 class FakeStore:
     def __init__(self) -> None:
         self.saved = None
+        self.metadata = ProfileMetadata("默认配置", "未标注游戏")
 
-    def save(self, *values: object) -> None:
+    def save(self, *values: object, metadata: ProfileMetadata | None = None) -> None:
         self.saved = values
+        if metadata is not None:
+            self.metadata = metadata
 
-    def load(self) -> tuple[object, ...]:
+    def load_profile(self, _path=None) -> tuple[object, ...]:
         from auto_ready.models import Region, Settings
 
-        return Settings(), Region(), None, None
+        return Settings(), Region(), None, None, self.metadata
+
+    def read_profile_metadata(self, _path=None) -> ProfileMetadata:
+        return self.metadata
 
 
 class FakeHotkey:
@@ -156,6 +172,15 @@ def _profile_index(combo, path: Path) -> int:
          if combo.itemData(index) is not None
          and Path(combo.itemData(index)).resolve() == expected),
         -1,
+    )
+
+
+def _template(backend: FakeBackend, name: str = "测试按钮") -> Template:
+    return Template(
+        backend.button_image[42:66, 76:108].copy(),
+        (backend.geometry.width, backend.geometry.height),
+        backend.geometry.dpi,
+        name,
     )
 
 
@@ -424,6 +449,165 @@ def test_loading_config_never_selects_or_enables_a_target(qtbot, close_main_wind
     assert not window.start_button.isEnabled()
 
 
+def test_startup_loads_default_template_pixels_and_static_view_without_rewriting(
+    qtbot, tmp_path, close_main_windows
+) -> None:
+    backend = FakeBackend()
+    store = ConfigStore(tmp_path / "profiles")
+    button = _template(backend, "默认按钮")
+    success = Template(
+        backend.success_image[42:66, 130:162].copy(),
+        (backend.geometry.width, backend.geometry.height),
+        backend.geometry.dpi,
+        "默认成功标志",
+    )
+    metadata = ProfileMetadata("真实默认名称", "真实游戏")
+    store.save(Settings(threshold=0.934), Region(), button, success, metadata=metadata)
+    config_bytes = store.config_path.read_bytes()
+    assets = {path: path.read_bytes() for path in store.templates_path.glob("*.png")}
+
+    window = MainWindow(
+        backend=backend, input_adapter=FakeInput(), store=store,
+        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0,
+    )
+    close_main_windows(window)
+
+    assert window._profile_content_ready
+    assert window.settings.threshold == pytest.approx(0.934)
+    assert window._current_profile_metadata == metadata
+    assert np.array_equal(window.button.image, button.image)
+    assert window.success is not None
+    assert np.array_equal(window.success.image, success.image)
+    assert window.identity is None
+    assert window.mode == Mode.REMIND
+    assert backend.sequence == 0
+    assert not window.button_template_thumbnail.pixmap().isNull()
+    window.show_template_preview()
+    assert not window.template_preview_dialog.button_card.image.pixmap().isNull()
+    assert "DPI 96" in window.template_preview_dialog.button_card.details.text()
+    assert store.config_path.read_bytes() == config_bytes
+    assert {path: path.read_bytes() for path in store.templates_path.glob("*.png")} == assets
+
+
+def test_corrupt_startup_profile_blocks_writes_and_allows_explicit_recovery(
+    qtbot, tmp_path, close_main_windows
+) -> None:
+    backend = FakeBackend()
+    store = ConfigStore(tmp_path / "profiles")
+    store.root.mkdir(parents=True)
+    store.config_path.write_bytes(b"not a profile")
+    corrupt_bytes = store.config_path.read_bytes()
+    recovery_path = tmp_path / "recovery.json"
+    recovery_button = _template(backend, "恢复按钮")
+    store.save_to(
+        recovery_path, Settings(threshold=0.941), Region(), recovery_button, None,
+        metadata=ProfileMetadata("恢复配置", "恢复游戏"),
+    )
+
+    window = MainWindow(
+        backend=backend, input_adapter=FakeInput(), store=store,
+        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0,
+    )
+    close_main_windows(window)
+    assert not window._profile_content_ready
+    assert "载入失败" in window.profile_status_label.text()
+    assert not window.save_button.isEnabled()
+    assert not window.rename_profile_button.isEnabled()
+    assert not window.onboarding_button.isEnabled()
+
+    window.save_config()
+    window.rename_profile()
+    assert store.config_path.read_bytes() == corrupt_bytes
+
+    window.load_config(recovery_path)
+    qtbot.waitUntil(lambda: not window._config_loading, timeout=3000)
+    assert window._profile_content_ready
+    assert window._current_config_path == recovery_path
+    assert window.settings.threshold == pytest.approx(0.941)
+    assert np.array_equal(window.button.image, recovery_button.image)
+
+
+def test_startup_default_load_retries_queue_rejection(qtbot, tmp_path, close_main_windows) -> None:
+    backend = FakeBackend()
+    store = ConfigStore(tmp_path / "profiles")
+    store.save(Settings(threshold=0.927), Region(), _template(backend), None)
+    window = MainWindow(
+        backend=backend, input_adapter=FakeInput(), store=store,
+        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0,
+    )
+    submit = window.worker.submit
+    attempts = 0
+
+    def reject_first_default_load(action, payload=None):
+        nonlocal attempts
+        if action == "load_config" and payload is not None and payload[0] is None:
+            attempts += 1
+            if attempts == 1:
+                return None
+        return submit(action, payload)
+
+    window.worker.submit = reject_first_default_load
+    close_main_windows(window)
+
+    assert attempts == 2
+    assert window._profile_content_ready
+    assert window.settings.threshold == pytest.approx(0.927)
+
+
+def test_named_profile_reuse_needs_no_capture_and_incompatible_target_keeps_crop(
+    qtbot, tmp_path, close_main_windows
+) -> None:
+    backend = FakeBackend()
+    store = ConfigStore(tmp_path / "profiles")
+    default_button = _template(backend, "默认按钮")
+    named_button = Template(
+        backend.success_image[42:66, 130:162].copy(),
+        (backend.geometry.width, backend.geometry.height),
+        backend.geometry.dpi,
+        "命名按钮",
+    )
+    incompatible_button = Template(
+        named_button.image.copy(),
+        (backend.geometry.width + 1, backend.geometry.height),
+        backend.geometry.dpi,
+        "尺寸不匹配按钮",
+    )
+    store.save(Settings(), Region(), default_button, None)
+    named_path = store.root / "named.json"
+    incompatible_path = store.root / "incompatible.json"
+    store.save_to(
+        named_path, Settings(), Region(), named_button, None,
+        metadata=ProfileMetadata("命名配置", "模拟游戏"),
+    )
+    store.save_to(
+        incompatible_path, Settings(), Region(), incompatible_button, None,
+        metadata=ProfileMetadata("不匹配配置", "模拟游戏"),
+    )
+    window = MainWindow(
+        backend=backend, input_adapter=FakeInput(), store=store,
+        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0,
+    )
+    close_main_windows(window)
+    assert np.array_equal(window.button.image, default_button.image)
+
+    window.load_config(named_path)
+    qtbot.waitUntil(lambda: not window._config_loading, timeout=3000)
+    assert np.array_equal(window.button.image, named_button.image)
+    qtbot.waitUntil(lambda: window.target_combo.count() == 2, timeout=3000)
+    window.target_combo.setCurrentIndex(1)
+    qtbot.waitUntil(lambda: window.geometry == backend.geometry, timeout=3000)
+    assert backend.sequence == 0
+    assert window.start_button.isEnabled()
+    assert "无需重复框选" in window.template_preview_dialog.compatibility_label.text()
+
+    window.load_config(incompatible_path)
+    qtbot.waitUntil(lambda: not window._config_loading, timeout=3000)
+    assert np.array_equal(window.button.image, incompatible_button.image)
+    assert not window.start_button.isEnabled()
+    assert "模板保留" in window.template_preview_dialog.compatibility_label.text()
+    assert backend.sequence == 0
+
+
 def test_profile_dialogs_save_switch_and_update_the_selected_profile(
     qtbot, tmp_path, close_main_windows, monkeypatch
 ) -> None:
@@ -436,6 +620,14 @@ def test_profile_dialogs_save_switch_and_update_the_selected_profile(
     profile_a = tmp_path / "profiles" / "profile-a.json"
     profile_b = tmp_path / "profiles" / "profile-b.json"
     save_paths = iter((profile_a, profile_b))
+    metadata_values = iter((
+        ProfileMetadata("配置甲", "游戏甲"),
+        ProfileMetadata("配置乙", "游戏乙"),
+    ))
+    monkeypatch.setattr(
+        window, "_edit_profile_metadata",
+        lambda _title, _description, _initial: next(metadata_values),
+    )
     monkeypatch.setattr(
         QFileDialog, "getSaveFileName",
         lambda *_args: (str(next(save_paths)), "JSON 配置 (*.json)"),
@@ -445,20 +637,26 @@ def test_profile_dialogs_save_switch_and_update_the_selected_profile(
     QTest.mouseClick(window.save_as_button, Qt.MouseButton.LeftButton)
     qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
     assert window._current_config_path == profile_a
-    assert window.current_config_label.text() == "当前配置：profile-a.json"
+    assert window.current_config_label.text() == "当前配置：配置甲\n对应游戏：游戏甲"
     assert window.current_config_label.toolTip() == str(profile_a)
     assert store.load_from(profile_a)[0].threshold == pytest.approx(0.901)
+    assert store.load_profile(profile_a)[4] == ProfileMetadata("配置甲", "游戏甲")
 
     window.threshold_spin.setValue(0.921)
     QTest.mouseClick(window.save_as_button, Qt.MouseButton.LeftButton)
     qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
     assert window._current_config_path == profile_b
     assert store.load_from(profile_b)[0].threshold == pytest.approx(0.921)
+    assert store.load_profile(profile_b)[4] == ProfileMetadata("配置乙", "游戏乙")
 
-    monkeypatch.setattr(
-        QFileDialog, "getOpenFileName",
-        lambda *_args: (str(profile_a), "JSON 配置 (*.json)"),
-    )
+    def choose_first_profile(dialog):
+        dialog.choice = next(
+            choice for choice in window._profile_choices()
+            if choice.path == profile_a.resolve()
+        )
+        return 1
+
+    monkeypatch.setattr(ProfileSelectionDialog, "exec", choose_first_profile)
     monkeypatch.setattr(
         QMessageBox, "question",
         lambda *_args: QMessageBox.StandardButton.Discard,
@@ -469,6 +667,7 @@ def test_profile_dialogs_save_switch_and_update_the_selected_profile(
     qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
     assert window.settings.threshold == pytest.approx(0.901)
     assert window._current_config_path == profile_a
+    assert window._current_profile_metadata == ProfileMetadata("配置甲", "游戏甲")
     assert window.mode == Mode.REMIND
     assert window.identity is None
     assert window.engine.snapshot().state == State.DISARMED
@@ -507,7 +706,9 @@ def test_profile_load_cancel_and_failure_preserve_config_and_path(
     qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
     assert window.settings == original_settings
     assert window._current_config_path == original_path
-    assert window.current_config_label.text() == "当前配置：config.json"
+    assert window.current_config_label.text() == (
+        "当前配置：默认配置\n对应游戏：未标注游戏"
+    )
     assert not window._config_loading
     assert window.engine.snapshot().state == State.DISARMED
 
@@ -520,14 +721,13 @@ def test_stale_profile_load_releases_controls_without_applying_or_relabeling(
     ConfigStore(tmp_path).save_to(profile, Settings(threshold=0.903), Region(), None, None)
     entered_load = threading.Event()
     release_load = threading.Event()
-    load_from = store.load_from
+    load_profile = store.load_profile
 
     def blocked_load(path):
         entered_load.set()
         assert release_load.wait(3)
-        return load_from(path)
+        return load_profile(path)
 
-    monkeypatch.setattr(store, "load_from", blocked_load)
     monkeypatch.setattr(
         QFileDialog, "getOpenFileName",
         lambda *_args: (str(profile), "JSON 配置 (*.json)"),
@@ -537,7 +737,10 @@ def test_stale_profile_load_releases_controls_without_applying_or_relabeling(
     close_main_windows(window)
     window.show()
     window.show_advanced()
+    monkeypatch.setattr(store, "load_profile", blocked_load)
     original_path = window._current_config_path
+    original_metadata = window._current_profile_metadata
+    original_label = window.current_config_label.text()
 
     window.choose_config_to_load()
     qtbot.waitUntil(entered_load.is_set, timeout=3000)
@@ -547,6 +750,8 @@ def test_stale_profile_load_releases_controls_without_applying_or_relabeling(
 
     assert window.settings.threshold == pytest.approx(0.947)
     assert window._current_config_path == original_path
+    assert window._current_profile_metadata == original_metadata
+    assert window.current_config_label.text() == f"{original_label} · 未保存修改"
     assert not window._config_loading
     assert window.engine.snapshot().state == State.DISARMED
     assert not window.start_button.isEnabled()
@@ -561,12 +766,19 @@ def test_stale_save_as_writes_captured_path_without_switching_current_profile(
     release_save = threading.Event()
     save_to = store.save_to
 
-    def blocked_save(path, settings, region, button, success):
+    def blocked_save(path, settings, region, button, success, *, metadata=None):
         entered_save.set()
         assert release_save.wait(3)
-        return save_to(path, settings, region, button, success)
+        return save_to(path, settings, region, button, success, metadata=metadata)
 
     monkeypatch.setattr(store, "save_to", blocked_save)
+    metadata = ProfileMetadata("快照名称", "快照游戏")
+    monkeypatch.setattr(
+        # The Save As dialog captures the immutable metadata alongside the settings.
+        # The stale completion must not apply it to the active profile.
+        MainWindow, "_edit_profile_metadata",
+        lambda _self, _title, _description, _initial: metadata,
+    )
     monkeypatch.setattr(
         QFileDialog, "getSaveFileName",
         lambda *_args: (str(profile), "JSON 配置 (*.json)"),
@@ -588,10 +800,346 @@ def test_stale_save_as_writes_captured_path_without_switching_current_profile(
 
     assert profile.is_file()
     assert store.load_from(profile)[0].threshold == pytest.approx(0.911)
+    assert store.load_profile(profile)[4] == metadata
     assert window.settings.threshold == pytest.approx(0.931)
     assert window._current_config_path == original_path
+    assert window._current_profile_metadata == ProfileMetadata("默认配置", "未标注游戏")
     assert window.current_config_label.text().startswith(original_label)
     assert "未保存修改" in window.current_config_label.text()
+
+
+def test_rename_cancellation_failure_and_retry_keep_profile_identity_atomic(
+    qtbot, tmp_path, close_main_windows, monkeypatch
+) -> None:
+    store = ConfigStore(tmp_path / "profiles")
+    active = store.root / "active.json"
+    old_metadata = ProfileMetadata("原名称", "原游戏")
+    store.save_to(active, Settings(), Region(), None, None, metadata=old_metadata)
+    original_bytes = active.read_bytes()
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    window._set_current_config_path(active)
+    window._set_current_profile_metadata(old_metadata)
+    window._saved_config_signature = window._config_signature()
+    old_label = window.current_config_label.text()
+
+    monkeypatch.setattr(window, "_edit_profile_metadata", lambda *_args: None)
+    window.rename_profile()
+    assert active.read_bytes() == original_bytes
+    assert window._current_profile_metadata == old_metadata
+    assert window.current_config_label.text() == old_label
+
+    new_metadata = ProfileMetadata("新名称", "新游戏")
+    monkeypatch.setattr(window, "_edit_profile_metadata", lambda *_args: new_metadata)
+    original_save_to = store.save_to
+    save_failed = threading.Event()
+
+    def failed_save(*_args, **_kwargs):
+        save_failed.set()
+        raise OSError("模拟磁盘失败")
+
+    monkeypatch.setattr(store, "save_to", failed_save)
+    window.threshold_spin.setValue(0.923)
+    window.rename_profile()
+    qtbot.waitUntil(save_failed.is_set, timeout=3000)
+    qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
+    assert window._current_config_path == active
+    assert window._current_profile_metadata == old_metadata
+    assert window.current_config_label.text().startswith(old_label)
+    assert active.read_bytes() == original_bytes
+
+    monkeypatch.setattr(store, "save_to", original_save_to)
+    window.rename_profile()
+    qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
+    saved_settings, _region, _button, _success, saved_metadata = store.load_profile(active)
+    assert saved_settings.threshold == pytest.approx(0.923)
+    assert saved_metadata == new_metadata
+    assert window._current_config_path == active
+    assert window._current_profile_metadata == new_metadata
+    assert window.current_config_label.text() == "当前配置：新名称\n对应游戏：新游戏"
+
+
+def test_save_as_metadata_cancellation_has_no_file_or_profile_write(
+    qtbot, tmp_path, close_main_windows, monkeypatch
+) -> None:
+    store = ConfigStore(tmp_path / "profiles")
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    original_path = window._current_config_path
+    original_metadata = window._current_profile_metadata
+    picker_calls = []
+    monkeypatch.setattr(window, "_edit_profile_metadata", lambda *_args: None)
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", lambda *_args: picker_calls.append(True)
+    )
+
+    window.save_config_as()
+
+    assert picker_calls == []
+    assert window._current_config_path == original_path
+    assert window._current_profile_metadata == original_metadata
+    assert not store.config_path.exists()
+    assert not store.root.exists()
+
+
+def test_duplicate_profile_labels_show_filename_and_path_in_chooser(
+    qtbot, tmp_path, close_main_windows
+) -> None:
+    store = ConfigStore(tmp_path / "profiles")
+    metadata = ProfileMetadata("同名配置", "同一游戏")
+    first = store.root / "first.json"
+    second = store.root / "second.json"
+    store.save_to(first, Settings(), Region(), None, None, metadata=metadata)
+    store.save_to(second, Settings(), Region(), None, None, metadata=metadata)
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    qtbot.waitUntil(lambda: first.resolve() in window._known_profiles
+                    and second.resolve() in window._known_profiles, timeout=3000)
+
+    first_index = _profile_index(window.profile_combo, first)
+    second_index = _profile_index(window.profile_combo, second)
+    first_label = window.profile_combo.itemText(first_index)
+    second_label = window.profile_combo.itemText(second_index)
+    assert first_label != second_label
+    assert "first.json" in first_label
+    assert "second.json" in second_label
+    choices = window._profile_choices()
+    assert any(
+        str(first) in choice.label and choice.path == first.resolve() for choice in choices
+    )
+    assert any(
+        str(second) in choice.label and choice.path == second.resolve() for choice in choices
+    )
+
+
+def test_legacy_profile_fallback_is_saveable_and_used_for_dirty_switch_save(
+    qtbot, tmp_path, close_main_windows, monkeypatch
+) -> None:
+    store = ConfigStore(tmp_path / "legacy")
+    store.save(Settings(threshold=0.921), Region(), None, None)
+    candidate = store.root / "candidate.json"
+    store.save_to(
+        candidate, Settings(threshold=0.913), Region(), None, None,
+        metadata=ProfileMetadata("候选配置", "候选游戏"),
+    )
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    qtbot.waitUntil(lambda: store.config_path.resolve() in window._known_profiles, timeout=3000)
+    assert window._current_profile_metadata == ProfileMetadata("默认配置", "未标注游戏")
+    assert window.current_config_label.text() == "当前配置：默认配置\n对应游戏：未标注游戏"
+
+    profile_refresh_started = threading.Event()
+    release_profile_refresh = threading.Event()
+    second_save_started = threading.Event()
+    release_second_save = threading.Event()
+    profile_refresh_applied = threading.Event()
+    filler_profile_started = threading.Event()
+    release_filler_profile = threading.Event()
+    original_execute = window.worker._execute
+    original_populate = window._populate_profile_combo
+    save_count = 0
+    profile_list_count = 0
+
+    def gated_execute(action: str, payload: object) -> object:
+        nonlocal profile_list_count, save_count
+        if action == "list_profiles":
+            profile_list_count += 1
+            if profile_list_count == 1:
+                profile_refresh_started.set()
+                if not release_profile_refresh.wait(5):
+                    raise RuntimeError("timed out waiting to release profile refresh")
+            elif profile_list_count == 2:
+                filler_profile_started.set()
+                if not release_filler_profile.wait(5):
+                    raise RuntimeError("timed out waiting to release queued profile reads")
+        if action == "save_config":
+            save_count += 1
+            if save_count == 2:
+                second_save_started.set()
+                if not release_second_save.wait(5):
+                    raise RuntimeError("timed out waiting to release second save")
+        return original_execute(action, payload)
+
+    def observe_profile_refresh(profiles: list[tuple[Path, ProfileMetadata]]) -> None:
+        original_populate(profiles)
+        if profile_refresh_started.is_set():
+            profile_refresh_applied.set()
+
+    monkeypatch.setattr(window.worker, "_execute", gated_execute)
+    monkeypatch.setattr(window, "_populate_profile_combo", observe_profile_refresh)
+    try:
+        window.threshold_spin.setValue(0.931)
+        window.save_config()
+        qtbot.waitUntil(
+            lambda: profile_refresh_started.is_set()
+            and window._pending_profile_request is None,
+            timeout=3000,
+        )
+        assert store.read_profile_metadata() == ProfileMetadata("默认配置", "未标注游戏")
+
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *_args: QMessageBox.StandardButton.Save,
+        )
+        window.threshold_spin.setValue(0.941)
+        window.profile_combo.setCurrentIndex(_profile_index(window.profile_combo, candidate))
+        assert window._pending_profile_switch == candidate.resolve()
+        assert window._pending_profile_action == "save_config"
+
+        release_profile_refresh.set()
+        qtbot.waitUntil(
+            lambda: second_save_started.is_set() and profile_refresh_applied.is_set(),
+            timeout=3000,
+        )
+        assert window._pending_profile_switch == candidate.resolve()
+        assert window.profile_combo.currentData() == candidate.resolve()
+
+        # Keep three harmless reads queued while one read is executing. The save
+        # completion must reserve the last worker slot for the requested load.
+        for _ in range(4):
+            assert window.worker.submit("list_profiles", window._profile_roots()) is not None
+        release_second_save.set()
+        qtbot.waitUntil(
+            lambda: filler_profile_started.is_set()
+            and window._pending_profile_action == "load_config",
+            timeout=3000,
+        )
+        assert window._pending_profile_switch_active
+
+        release_filler_profile.set()
+        qtbot.waitUntil(
+            lambda: window._current_config_path == candidate.resolve()
+            and window._pending_profile_request is None and not window._config_loading,
+            timeout=5000,
+        )
+    finally:
+        release_profile_refresh.set()
+        release_second_save.set()
+        release_filler_profile.set()
+
+    assert store.load_profile(store.config_path)[4] == ProfileMetadata(
+        "默认配置", "未标注游戏"
+    )
+    assert window._current_profile_metadata == ProfileMetadata("候选配置", "候选游戏")
+    assert window._pending_profile_switch is None
+
+
+def test_dirty_save_can_switch_back_to_default_profile(qtbot, tmp_path, close_main_windows,
+                                                       monkeypatch) -> None:
+    store = ConfigStore(tmp_path / "profiles")
+    store.save(Settings(threshold=0.921), Region(), None, None,
+               metadata=ProfileMetadata("默认", "游戏甲"))
+    candidate = store.root / "candidate.json"
+    store.save_to(
+        candidate, Settings(threshold=0.913), Region(), None, None,
+        metadata=ProfileMetadata("候选", "游戏乙"),
+    )
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    qtbot.waitUntil(lambda: candidate.resolve() in window._known_profiles, timeout=3000)
+
+    window.profile_combo.setCurrentIndex(_profile_index(window.profile_combo, candidate))
+    qtbot.waitUntil(
+        lambda: window._current_config_path == candidate.resolve()
+        and window._pending_profile_request is None and not window._config_loading,
+        timeout=3000,
+    )
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        lambda *_args: QMessageBox.StandardButton.Save,
+    )
+    window.threshold_spin.setValue(0.941)
+    window.profile_combo.setCurrentIndex(window.profile_combo.findData(None))
+    assert window._pending_profile_switch is None
+    assert window._pending_profile_switch_active
+
+    qtbot.waitUntil(
+        lambda: window._current_config_path == store.config_path.resolve()
+        and window._pending_profile_request is None and not window._config_loading,
+        timeout=5000,
+    )
+    assert not window._pending_profile_switch_active
+    assert store.load_profile(candidate)[0].threshold == pytest.approx(0.941)
+    assert window.settings.threshold == pytest.approx(0.921)
+    assert window._current_profile_metadata == ProfileMetadata("默认", "游戏甲")
+
+
+def test_profile_load_queue_rejection_keeps_current_profile(qtbot, tmp_path, close_main_windows,
+                                                            monkeypatch) -> None:
+    store = ConfigStore(tmp_path / "profiles")
+    store.save(Settings(threshold=0.921), Region(), None, None,
+               metadata=ProfileMetadata("默认", "游戏甲"))
+    candidate = store.root / "candidate.json"
+    store.save_to(
+        candidate, Settings(threshold=0.913), Region(), None, None,
+        metadata=ProfileMetadata("候选", "游戏乙"),
+    )
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    qtbot.waitUntil(lambda: candidate.resolve() in window._known_profiles, timeout=3000)
+    original_submit = window.worker.submit
+
+    def reject_profile_load(action: str, payload: object = None) -> int | None:
+        if action == "load_config":
+            return None
+        return original_submit(action, payload)
+
+    monkeypatch.setattr(window.worker, "submit", reject_profile_load)
+    window.profile_combo.setCurrentIndex(_profile_index(window.profile_combo, candidate))
+
+    assert window._current_config_path == store.config_path
+    assert window._current_profile_metadata == ProfileMetadata("默认", "游戏甲")
+    assert window.profile_combo.currentData() is None
+    assert window._pending_profile_request is None
+    assert window._pending_profile_switch is None
+    assert not window._pending_profile_switch_active
+    assert not window._config_loading
+    assert "未载入所选配置" in window.status_label.text()
+    assert store.load_profile(store.config_path)[0].threshold == pytest.approx(0.921)
+
+
+def test_long_legacy_filename_uses_bounded_fallback_and_can_be_saved(
+    qtbot, tmp_path, close_main_windows
+) -> None:
+    store = ConfigStore(tmp_path / "profiles")
+    profile = store.root / f"{'L' * 100}.json"
+    store.save_to(profile, Settings(threshold=0.913), Region(), None, None)
+    assert store.read_profile_metadata(profile) == ProfileMetadata()
+
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    qtbot.waitUntil(lambda: profile.resolve() in window._known_profiles, timeout=3000)
+    index = _profile_index(window.profile_combo, profile)
+    assert "L" * 80 in window.profile_combo.itemText(index)
+    assert window.profile_combo.itemData(index, Qt.ItemDataRole.ToolTipRole) == str(
+        profile.resolve()
+    )
+
+    window.profile_combo.setCurrentIndex(index)
+    qtbot.waitUntil(
+        lambda: window._current_config_path == profile.resolve()
+        and window._pending_profile_request is None and not window._config_loading,
+        timeout=3000,
+    )
+    assert window._current_profile_metadata == ProfileMetadata("L" * 80, "未标注游戏")
+    assert window.current_config_label.toolTip() == str(profile.resolve())
+    window.save_config()
+    qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
+    assert store.load_profile(profile)[4] == ProfileMetadata("L" * 80, "未标注游戏")
 
 
 def test_cancelled_template_import_stops_active_round_before_opening_picker(
@@ -646,14 +1194,14 @@ def test_profile_and_import_actions_exclude_each_other_and_release_after_failure
     )
     load_entered = threading.Event()
     release_load = threading.Event()
-    load_from = store.load_from
+    load_profile = store.load_profile
 
     def blocked_load(path):
         load_entered.set()
         assert release_load.wait(3)
-        return load_from(path)
+        return load_profile(path)
 
-    monkeypatch.setattr(store, "load_from", blocked_load)
+    monkeypatch.setattr(store, "load_profile", blocked_load)
     open_calls: list[str] = []
     dialogs = [(str(profile), "JSON 配置 (*.json)"), ("fake-template.png", "PNG (*.png)")]
 
@@ -964,7 +1512,7 @@ def test_failed_dirty_profile_save_prevents_switch(
     profile = store.root / "candidate.json"
     store.save_to(profile, Settings(threshold=0.915), Region(), None, None)
 
-    def fail_save(*_args):
+    def fail_save(*_args, **_kwargs):
         raise OSError("simulated disk failure")
 
     monkeypatch.setattr(store, "save", fail_save)

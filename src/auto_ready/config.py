@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import tempfile
-from dataclasses import asdict, fields
+import unicodedata
+from dataclasses import asdict, dataclass, fields
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -24,6 +25,24 @@ MAX_TEMPLATE_BYTES = 8 * 1024 * 1024
 MAX_TEMPLATE_DIMENSION = 4096
 MAX_TEMPLATE_PIXELS = 16 * 1024 * 1024
 _TEMPLATE_REF = re.compile(r"templates/[A-Za-z0-9_-]{1,100}\.png\Z")
+
+
+@dataclass(frozen=True)
+class ProfileMetadata:
+    """Display-only labels attached to a saved profile."""
+
+    name: str = ""
+    game: str = ""
+
+    def validate(self) -> None:
+        for field_name in ("name", "game"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str):
+                raise ValueError(f"profile.{field_name} 必须是字符串")
+            if len(value) > 80:
+                raise ValueError(f"profile.{field_name} 不能超过 80 个字符")
+            if any(unicodedata.category(char) in {"Cc", "Cs"} for char in value):
+                raise ValueError(f"profile.{field_name} 不能包含控制字符或无效 Unicode")
 
 
 def _default_root() -> Path:
@@ -78,6 +97,12 @@ def _safe_template_path(root: Path, reference: Any) -> Path:
     return path
 
 
+def _safe_template_destination(root: Path, reference: str) -> Path:
+    """Validate an asset destination while preserving its lexical filename."""
+    _safe_template_path(root, reference)
+    return root / Path(*reference.split("/"))
+
+
 def load_template(path: Path, geometry: Geometry) -> Template:
     """Load a bounded PNG template, associating it with current client geometry."""
     template_path = Path(path)
@@ -120,18 +145,19 @@ class ConfigStore:
         self.templates_path = self.root / "templates"
 
     def save(self, settings: Settings, region: Region, button: Template | None,
-             success: Template | None) -> None:
+             success: Template | None, *, metadata: ProfileMetadata | None = None) -> None:
         _validate_settings(settings)
         region.validate()
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.templates_path.mkdir(parents=True, exist_ok=True)
-        try:
-            self.templates_path.resolve().relative_to(self.root.resolve())
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise ValueError("模板目录必须位于配置目录内") from exc
+        if metadata is None:
+            metadata = self._existing_profile_metadata()
+        elif not isinstance(metadata, ProfileMetadata):
+            raise ValueError("metadata 必须是 ProfileMetadata")
+        if metadata is not None:
+            metadata.validate()
 
         entries: dict[str, dict[str, Any] | None] = {}
-        pending_images: list[tuple[Path, bytes]] = []
+        pending_images: dict[Path, bytes] = {}
+        existing_images = self._currently_referenced_template_images()
         for key, template in (("button_template", button), ("success_template", success)):
             if template is None:
                 entries[key] = None
@@ -153,14 +179,31 @@ class ConfigStore:
             png = encoded.tobytes()
             if len(png) > MAX_TEMPLATE_BYTES:
                 raise ValueError(f"{key} PNG 文件大小超出允许范围")
-            filename = f"{key.replace('_template', '')}-{uuid4().hex}.png"
-            reference = f"templates/{filename}"
+            digest = hashlib.sha256(png).hexdigest()
+            filename = f"image-{digest}.png"
+            content_reference = f"templates/{filename}"
+            destination = _safe_template_destination(self.root, content_reference)
+            asset_exists = destination.exists() or destination.is_symlink()
+            previous_reference = existing_images.get(key)
+            if (previous_reference is not None
+                    and np.array_equal(previous_reference[1], template.image)):
+                reference = previous_reference[0]
+                if reference == content_reference:
+                    if not asset_exists:
+                        raise ValueError(
+                            f"{key} 的内容寻址 PNG 不存在：{destination}")
+                    self._validate_content_asset(key, destination, png)
+            elif asset_exists:
+                self._validate_content_asset(key, destination, png)
+                reference = content_reference
+            else:
+                reference = content_reference
+                pending_images[destination] = png
             entries[key] = {
                 "file": reference,
                 "reference_size": list(template.reference_size),
                 "dpi": template.dpi,
             }
-            pending_images.append((self.templates_path / filename, png))
 
         document = {
             "schema_version": SCHEMA_VERSION,
@@ -168,32 +211,68 @@ class ConfigStore:
             "region": asdict(region),
             **entries,
         }
+        if metadata is not None:
+            document["profile"] = asdict(metadata)
         encoded_config = (json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False)
                           + "\n").encode("utf-8")
         if len(encoded_config) > MAX_CONFIG_BYTES:
             raise ValueError("配置文件大小超出允许范围")
 
-        # Unique template names avoid changing assets referenced by the prior
-        # config. Replace JSON last, so any failure before this point preserves it.
-        for destination, contents in pending_images:
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.templates_path.mkdir(parents=True, exist_ok=True)
+        try:
+            self.templates_path.resolve().relative_to(self.root.resolve())
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError("模板目录必须位于配置目录内") from exc
+
+        # Immutable content-addressed names preserve assets referenced by prior
+        # configs. Replace JSON last, so failures preserve the previous profile.
+        for destination, contents in pending_images.items():
             self._atomic_write(destination, contents)
         self._atomic_write(self.config_path, encoded_config)
 
     def save_to(self, path: Path, settings: Settings, region: Region,
-                button: Template | None, success: Template | None) -> None:
+                button: Template | None, success: Template | None, *,
+                metadata: ProfileMetadata | None = None) -> None:
         """Save a profile JSON and its templates beside the selected file."""
         store = self._store_for_profile(path)
-        store.save(settings, region, button, success)
+        store.save(settings, region, button, success, metadata=metadata)
 
     def load(self) -> tuple[Settings, Region, Template | None, Template | None]:
         return self._load(require_existing=False)
 
     def _load(self, *, require_existing: bool
               ) -> tuple[Settings, Region, Template | None, Template | None]:
+        settings, region, button, success, _, _ = self._load_profile_data(
+            require_existing=require_existing)
+        return settings, region, button, success
+
+    def load_profile(self, path: Path | None = None
+                     ) -> tuple[Settings, Region, Template | None, Template | None,
+                                ProfileMetadata]:
+        """Load a profile and its display labels from one JSON snapshot."""
+        if path is None:
+            return self._load_profile_data(require_existing=False)[:5]
+        store = self._store_for_profile(path, require_existing=True)
+        return store._load_profile_data(require_existing=True)[:5]
+
+    def read_profile_metadata(self, path: Path | None = None) -> ProfileMetadata:
+        """Read validated labels without decoding referenced PNG files."""
+        if path is None:
+            store = self
+            require_existing = False
+        else:
+            store = self._store_for_profile(path, require_existing=True)
+            require_existing = True
+        parsed = store._load_profile_data(require_existing=require_existing,
+                                          decode_templates=False)
+        return parsed[4]
+
+    def _read_config_document(self, *, require_existing: bool) -> Any | None:
         if not self.config_path.exists():
             if require_existing:
                 raise ValueError(f"所选配置文件不存在：{self.config_path}")
-            return Settings(), Region(), None, None
+            return None
         try:
             try:
                 self.config_path.resolve().relative_to(self.root.resolve())
@@ -203,20 +282,32 @@ class ConfigStore:
                 raw_config = stream.read(MAX_CONFIG_BYTES + 1)
             if len(raw_config) <= 0 or len(raw_config) > MAX_CONFIG_BYTES:
                 raise ValueError("配置文件大小无效")
-            document = json.loads(raw_config.decode("utf-8"))
+            return json.loads(raw_config.decode("utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
             raise ValueError(f"无法读取配置文件 {self.config_path}：{exc}") from exc
+
+    def _load_profile_data(self, *, require_existing: bool,
+                           decode_templates: bool = True
+                           ) -> tuple[Settings, Region, Template | None, Template | None,
+                                      ProfileMetadata, bool]:
+        document = self._read_config_document(require_existing=require_existing)
+        if document is None:
+            return Settings(), Region(), None, None, ProfileMetadata(), False
         if not isinstance(document, dict):
             raise ValueError("配置文件根节点必须是 JSON 对象")
         version = document.get("schema_version")
         if isinstance(version, bool) or version != SCHEMA_VERSION:
             raise ValueError(f"不支持的配置版本 {version!r}；当前版本为 {SCHEMA_VERSION}")
-        allowed_document = {"schema_version", "settings", "region", "button_template",
-                            "success_template"}
-        if set(document) != allowed_document:
+        required_document = {"schema_version", "settings", "region", "button_template",
+                             "success_template"}
+        if (not required_document.issubset(document)
+                or set(document) - required_document - {"profile"}):
             raise ValueError("配置文件字段不匹配；请检查版本、设置、区域和模板字段")
 
         try:
+            has_profile = "profile" in document
+            metadata = self._parse_profile_metadata(document["profile"]) if has_profile else (
+                ProfileMetadata())
             settings_data = document["settings"]
             if not isinstance(settings_data, dict):
                 raise ValueError("settings 必须是对象")
@@ -240,12 +331,73 @@ class ConfigStore:
             _validate_region_values(region_data)
             region = Region(**region_data)
             region.validate()
-            button = self._load_saved_template(document.get("button_template"), "button_template")
-            success = self._load_saved_template(
-                document.get("success_template"), "success_template")
+            if decode_templates:
+                button = self._load_saved_template(document["button_template"],
+                                                   "button_template")
+                success = self._load_saved_template(document["success_template"],
+                                                    "success_template")
+            else:
+                self._validate_saved_template_entry(document["button_template"],
+                                                    "button_template")
+                self._validate_saved_template_entry(document["success_template"],
+                                                    "success_template")
+                button = success = None
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"配置文件内容无效：{exc}") from exc
-        return settings, region, button, success
+        return settings, region, button, success, metadata, has_profile
+
+    @staticmethod
+    def _parse_profile_metadata(data: Any) -> ProfileMetadata:
+        if not isinstance(data, dict) or set(data) != {"name", "game"}:
+            raise ValueError("profile 必须只包含 name、game 字段")
+        metadata = ProfileMetadata(**data)
+        metadata.validate()
+        return metadata
+
+    def _existing_profile_metadata(self) -> ProfileMetadata | None:
+        """Preserve a valid existing profile label object during ordinary saves."""
+        try:
+            parsed = self._load_profile_data(require_existing=False,
+                                             decode_templates=False)
+        except ValueError:
+            return None
+        return parsed[4] if parsed[5] else None
+
+    def _currently_referenced_template_images(self) -> dict[str, tuple[str, np.ndarray]]:
+        """Read only this profile's bounded, validated references for pixel reuse."""
+        try:
+            document = self._read_config_document(require_existing=False)
+        except ValueError:
+            return {}
+        if (not isinstance(document, dict)
+                or isinstance(document.get("schema_version"), bool)
+                or document.get("schema_version") != SCHEMA_VERSION):
+            return {}
+
+        images: dict[str, tuple[str, np.ndarray]] = {}
+        for key in ("button_template", "success_template"):
+            try:
+                path, reference_size, dpi = self._validate_saved_template_entry(
+                    document.get(key), key)
+                if path is None:
+                    continue
+                geometry = Geometry(0, 0, reference_size[0], reference_size[1], dpi)
+                loaded = load_template(path, geometry)
+            except (TypeError, ValueError):
+                # A stale, malformed, or unreadable old reference is not trusted.
+                continue
+            images[key] = (document[key]["file"], loaded.image)
+        return images
+
+    @staticmethod
+    def _validate_content_asset(key: str, destination: Path, png: bytes) -> None:
+        try:
+            with destination.open("rb") as stream:
+                existing_png = stream.read(MAX_TEMPLATE_BYTES + 1)
+        except OSError as exc:
+            raise ValueError(f"{key} 的内容寻址 PNG 无法读取：{destination}") from exc
+        if existing_png != png:
+            raise ValueError(f"{key} 的内容寻址 PNG 已存在但内容不匹配：{destination}")
 
     def load_from(self, path: Path) -> tuple[Settings, Region, Template | None, Template | None]:
         """Load an explicit profile, reporting a missing selection as an error."""
@@ -275,8 +427,16 @@ class ConfigStore:
         return store
 
     def _load_saved_template(self, entry: Any, key: str) -> Template | None:
-        if entry is None:
+        path, reference_size, dpi = self._validate_saved_template_entry(entry, key)
+        if path is None:
             return None
+        geometry = Geometry(0, 0, reference_size[0], reference_size[1], dpi)
+        return load_template(path, geometry)
+
+    def _validate_saved_template_entry(self, entry: Any, key: str
+                                       ) -> tuple[Path | None, list[int] | None, int | None]:
+        if entry is None:
+            return None, None, None
         if not isinstance(entry, dict):
             raise ValueError(f"{key} 必须为 null 或对象")
         if set(entry) != {"file", "reference_size", "dpi"}:
@@ -289,8 +449,7 @@ class ConfigStore:
                 or not isinstance(dpi, int) or isinstance(dpi, bool) or dpi <= 0):
             raise ValueError(f"{key} 的参考几何无效")
         path = _safe_template_path(self.root, entry.get("file"))
-        geometry = Geometry(0, 0, reference_size[0], reference_size[1], dpi)
-        return load_template(path, geometry)
+        return path, reference_size, dpi
 
     @staticmethod
     def _atomic_write(destination: Path, contents: bytes) -> None:
