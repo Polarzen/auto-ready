@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -11,10 +12,11 @@ import numpy as np
 import pytest
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QFileDialog
+from PySide6.QtWidgets import QFileDialog, QMessageBox, QSystemTrayIcon
 
 from auto_ready.app import main
 from auto_ready.config import ConfigStore
+from auto_ready.engine import Engine
 from auto_ready.models import (
     Frame,
     Geometry,
@@ -26,7 +28,7 @@ from auto_ready.models import (
     State,
     Template,
 )
-from auto_ready.ui import ImagePreview, MainWindow, _WorkerResult
+from auto_ready.ui import ImagePreview, MainWindow, _IOWorker, _WorkerResult, close_and_wait
 
 
 @pytest.fixture
@@ -41,9 +43,7 @@ def close_main_windows(qtbot):
     yield register
 
     for window in windows:
-        window.close()
-        qtbot.waitUntil(lambda window=window: not window.worker.isRunning(), timeout=5000)
-        qtbot.waitUntil(lambda window=window: window._closed, timeout=3000)
+        close_and_wait(window)
 
 
 class FakeBackend:
@@ -137,15 +137,26 @@ class FakeHotkey:
 
 
 class FakeClock:
-    def __init__(self, start: float) -> None:
+    def __init__(self, start: float, step: float = 0.02) -> None:
         self.value = start
+        self.step = step
         self.lock = threading.Lock()
 
     def __call__(self) -> float:
         with self.lock:
             current = self.value
-            self.value += 0.02
+            self.value += self.step
             return current
+
+
+def _profile_index(combo, path: Path) -> int:
+    expected = Path(path).resolve()
+    return next(
+        (index for index in range(combo.count())
+         if combo.itemData(index) is not None
+         and Path(combo.itemData(index)).resolve() == expected),
+        -1,
+    )
 
 
 def test_image_preview_maps_letterboxed_drag_to_physical_pixels(qtbot) -> None:
@@ -189,7 +200,7 @@ def test_fake_backend_workflow_previews_and_starts_in_remind_mode(
     window.show()
 
     qtbot.waitUntil(lambda: window.target_combo.count() == 2, timeout=3000)
-    assert window.status_label.text().startswith("已找到 1 个可见窗口")
+    assert "下一步：" in window.status_label.text()
     window.target_combo.setCurrentIndex(1)
     qtbot.waitUntil(lambda: window.geometry == backend.geometry, timeout=3000)
     window.capture_static()
@@ -208,8 +219,9 @@ def test_fake_backend_workflow_previews_and_starts_in_remind_mode(
     button_template = window.button
 
     backend.show_success()
+    first_frame = window._static_frame
     window.capture_static()
-    qtbot.waitUntil(lambda: window._static_frame is not None, timeout=3000)
+    qtbot.waitUntil(lambda: window._static_frame is not first_frame, timeout=3000)
     assert window.button is button_template
     assert window.region == expected_region
     window.selection_combo.setCurrentIndex(3)
@@ -219,20 +231,30 @@ def test_fake_backend_workflow_previews_and_starts_in_remind_mode(
     assert window.button is button_template
 
     backend.show_button()
+    second_frame = window._static_frame
     window.capture_static()
-    qtbot.waitUntil(lambda: window._static_frame is not None, timeout=3000)
+    qtbot.waitUntil(lambda: window._static_frame is not second_frame, timeout=3000)
     assert window.button is button_template
     assert window.success is success_template
     assert window.region == expected_region
 
     window.frames_spin.setValue(2)
     window.stable_spin.setValue(0.2)
-    fake_clock = FakeClock(backend._last_captured_at + 0.01)
+    fake_clock = FakeClock(backend._last_captured_at + 0.001, step=0.01)
     backend.clock = fake_clock
     window.engine.clock = fake_clock
 
+    preview_results = []
+    handle_result = window._handle_result
+
+    def record_result(result):
+        handle_result(result)
+        if result.action == "preview":
+            preview_results.append(result)
+
+    window._handle_result = record_result
     window.preview_without_input()
-    qtbot.waitUntil(lambda: window.status_label.text().startswith("无点击预览"), timeout=3000)
+    qtbot.waitUntil(lambda: bool(preview_results), timeout=3000)
     assert window.engine.snapshot().state == State.DISARMED
 
     backend.foreground_active = False
@@ -247,7 +269,7 @@ def test_fake_backend_workflow_previews_and_starts_in_remind_mode(
     assert window.resume_button.isEnabled()
     backend.foreground_active = True
     window.resume_round()
-    qtbot.waitUntil(lambda: window.engine.snapshot().state == State.UNCONFIRMED, timeout=5000)
+    qtbot.waitUntil(lambda: window.engine.snapshot().state == State.REMINDED, timeout=5000)
     snapshot = window.engine.snapshot()
     assert "仅提醒模式未发送输入" in snapshot.reason
     assert input_adapter.calls == []
@@ -259,10 +281,13 @@ def test_fake_backend_workflow_previews_and_starts_in_remind_mode(
     window.start_round()
     qtbot.waitUntil(
         lambda: (window.engine.snapshot().session_id != previous_session
-                 and window.engine.snapshot().state == State.SUCCESS),
-        timeout=6000,
+                 and window.engine.snapshot().state in {
+                     State.SUCCESS, State.UNCONFIRMED, State.ERROR, State.REMINDED,
+                 }),
+        timeout=10000,
     )
     snapshot = window.engine.snapshot()
+    assert snapshot.state == State.SUCCESS, snapshot
     assert input_adapter.calls == [(112, 84)]
 
     hotkey = window._hotkey
@@ -271,7 +296,7 @@ def test_fake_backend_workflow_previews_and_starts_in_remind_mode(
     assert not window.engine._hotkey_ready()
     qtbot.waitUntil(lambda: window.worker._last_hotkey_availability is False, timeout=3000)
     window.start_round()
-    qtbot.waitUntil(lambda: window.status_label.text().startswith("无法开始"), timeout=3000)
+    qtbot.waitUntil(lambda: not window.start_button.isEnabled(), timeout=3000)
     assert input_adapter.calls == [(112, 84)]
 
 
@@ -349,7 +374,7 @@ def test_failed_restart_shows_frozen_previous_duration(qtbot, close_main_windows
     qtbot.waitUntil(lambda: window._static_frame is not None, timeout=3000)
     window.selection_combo.setCurrentIndex(1)
     window._selection_made(Rect(76, 42, 32, 24))
-    fake_clock = FakeClock(backend._last_captured_at + 0.01)
+    fake_clock = FakeClock(backend._last_captured_at + 0.001, step=0.01)
     backend.clock = window.engine.clock = fake_clock
     backend.foreground_active = False
     window.start_round()
@@ -407,6 +432,7 @@ def test_profile_dialogs_save_switch_and_update_the_selected_profile(
                         hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
     close_main_windows(window)
     window.show()
+    window.show_advanced()
     profile_a = tmp_path / "profiles" / "profile-a.json"
     profile_b = tmp_path / "profiles" / "profile-b.json"
     save_paths = iter((profile_a, profile_b))
@@ -432,6 +458,10 @@ def test_profile_dialogs_save_switch_and_update_the_selected_profile(
     monkeypatch.setattr(
         QFileDialog, "getOpenFileName",
         lambda *_args: (str(profile_a), "JSON 配置 (*.json)"),
+    )
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        lambda *_args: QMessageBox.StandardButton.Discard,
     )
     window.threshold_spin.setValue(0.941)
     QTest.mouseClick(window.load_button, Qt.MouseButton.LeftButton)
@@ -506,6 +536,7 @@ def test_stale_profile_load_releases_controls_without_applying_or_relabeling(
                         hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
     close_main_windows(window)
     window.show()
+    window.show_advanced()
     original_path = window._current_config_path
 
     window.choose_config_to_load()
@@ -544,6 +575,7 @@ def test_stale_save_as_writes_captured_path_without_switching_current_profile(
                         hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
     close_main_windows(window)
     window.show()
+    window.show_advanced()
     original_path = window._current_config_path
     original_label = window.current_config_label.text()
     window.threshold_spin.setValue(0.911)
@@ -558,7 +590,8 @@ def test_stale_save_as_writes_captured_path_without_switching_current_profile(
     assert store.load_from(profile)[0].threshold == pytest.approx(0.911)
     assert window.settings.threshold == pytest.approx(0.931)
     assert window._current_config_path == original_path
-    assert window.current_config_label.text() == original_label
+    assert window.current_config_label.text().startswith(original_label)
+    assert "未保存修改" in window.current_config_label.text()
 
 
 def test_cancelled_template_import_stops_active_round_before_opening_picker(
@@ -842,3 +875,147 @@ def test_hotkey_text_change_revokes_a_queued_start(qtbot, close_main_windows) ->
     window._hotkey.available = False
     qtbot.waitUntil(lambda: window.engine.snapshot().state == State.ERROR, timeout=3000)
     assert input_adapter.calls == []
+
+
+def test_dashboard_keeps_stop_visible_and_defaults_disarmed_and_unchecked(
+    qtbot, close_main_windows
+) -> None:
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=FakeStore(),
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    qtbot.wait(20)
+
+    assert window.stop_button.isVisible()
+    assert not window.stop_button.isEnabled()
+    assert window.mode == Mode.REMIND
+    assert not window.allow_activation_checkbox.isChecked()
+    assert window.start_button.text() == "开始等待"
+    assert window.advanced_dialog.isHidden()
+    assert window.advanced_dialog.isAncestorOf(window.load_button)
+    assert window.advanced_dialog.isAncestorOf(window.save_as_button)
+
+
+def test_capture_release_failure_is_retained_and_reported() -> None:
+    class FailingReleaseBackend(FakeBackend):
+        def release_capture(self) -> None:
+            raise OSError("native stop failed")
+
+    backend = FailingReleaseBackend()
+    engine = Engine(backend, FakeInput(), lambda: None)
+    worker = _IOWorker(engine, backend, FakeStore(), lambda *_args: None, lambda: True)
+    worker._capture_may_be_active = True
+
+    assert not worker._release_capture()
+    assert worker.capture_release_errors() == ("OSError: native stop failed",)
+    results = worker.take_results()
+    assert [(result.action, result.error) for result in results] == [
+        ("capture_release", "OSError: native stop failed")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("choice", "expected_threshold"),
+    [
+        (QMessageBox.StandardButton.Cancel, 0.931),
+        (QMessageBox.StandardButton.Discard, 0.915),
+        (QMessageBox.StandardButton.Save, 0.915),
+    ],
+)
+def test_dirty_profile_switch_requires_explicit_choice(
+    qtbot, tmp_path, close_main_windows, monkeypatch, choice, expected_threshold
+) -> None:
+    store = ConfigStore(tmp_path / "profiles")
+    profile = store.root / "candidate.json"
+    store.save_to(profile, Settings(threshold=0.915), Region(), None, None)
+    answers = []
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *_args: (answers.append(True), choice)[1]
+    )
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    qtbot.waitUntil(lambda: _profile_index(window.profile_combo, profile) >= 0, timeout=3000)
+
+    window.threshold_spin.setValue(0.931)
+    index = _profile_index(window.profile_combo, profile)
+    window.profile_combo.setCurrentIndex(index)
+    qtbot.waitUntil(
+        lambda: window._pending_profile_request is None and not window._config_loading
+        and window.settings.threshold == pytest.approx(expected_threshold),
+        timeout=5000,
+    )
+
+    assert answers == [True]
+    if choice == QMessageBox.StandardButton.Cancel:
+        assert window._current_config_path == store.config_path
+        assert window.profile_combo.currentData() is None
+    else:
+        assert window._current_config_path == profile.resolve()
+    if choice == QMessageBox.StandardButton.Save:
+        assert store.load()[0].threshold == pytest.approx(0.931)
+
+
+def test_failed_dirty_profile_save_prevents_switch(
+    qtbot, tmp_path, close_main_windows, monkeypatch
+) -> None:
+    store = ConfigStore(tmp_path / "profiles")
+    profile = store.root / "candidate.json"
+    store.save_to(profile, Settings(threshold=0.915), Region(), None, None)
+
+    def fail_save(*_args):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(store, "save", fail_save)
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *_args: QMessageBox.StandardButton.Save
+    )
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=store,
+                        hotkey_factory=FakeHotkey, notifier=lambda: None, capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    qtbot.waitUntil(lambda: _profile_index(window.profile_combo, profile) >= 0, timeout=3000)
+    window.threshold_spin.setValue(0.931)
+    window.profile_combo.setCurrentIndex(_profile_index(window.profile_combo, profile))
+    qtbot.waitUntil(lambda: window._pending_profile_request is None, timeout=3000)
+
+    assert window.settings.threshold == pytest.approx(0.931)
+    assert window._current_config_path == store.config_path
+    assert window.profile_combo.currentData() is None
+    assert window._pending_profile_switch is None
+    assert "simulated disk failure" in window.status_label.text()
+
+
+def test_stale_notification_is_discarded_and_tray_menu_restores_and_hides(
+    qtbot, close_main_windows, monkeypatch
+) -> None:
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    sounds = []
+    window = MainWindow(backend=FakeBackend(), input_adapter=FakeInput(), store=FakeStore(),
+                        hotkey_factory=FakeHotkey, notifier=lambda: sounds.append("sound"),
+                        capture_delay=0)
+    close_main_windows(window)
+    window.show()
+    menu = window._tray_icon.contextMenu()
+    actions = {action.text(): action for action in menu.actions() if action.text()}
+    assert {"显示主界面", "隐藏主界面", "停止本轮", "退出"}.issubset(actions)
+
+    actions["隐藏主界面"].trigger()
+    assert not window.isVisible()
+    actions["显示主界面"].trigger()
+    assert window.isVisible()
+
+    snapshot = window.engine.snapshot()
+    revision, epoch = window.worker.notification_context()
+    window._emit_notification("当前通知")
+    assert sounds == ["sound"]
+    window.worker.invalidate_authorization()
+    window._show_notification("过期通知", snapshot.session_id, snapshot.state.value,
+                              revision, epoch)
+    assert sounds == ["sound"]
+
+    actions["停止本轮"].trigger()
+    assert window.engine.snapshot().state == State.DISARMED
+    actions["退出"].trigger()
+    qtbot.waitUntil(lambda: window._closed, timeout=5000)

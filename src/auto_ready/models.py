@@ -110,6 +110,31 @@ class Frame:
     captured_at: float
     session_id: str
     sequence: int
+    capture_generation: int = 0
+    source_sequence: int | None = None
+    source_time_100ns: int | None = None
+    received_at: float | None = None
+    backend: str = "gdi"
+
+
+@dataclass(frozen=True)
+class CaptureStatus:
+    """Current target evidence, never a permanent compatibility promise."""
+
+    backend: str = "unselected"
+    supported: bool | None = None
+    valid_frame: bool = False
+    background_supported: bool = False
+    foreground: bool | None = None
+    obscured: bool | None = None
+    minimized: bool | None = None
+    fresh: bool = False
+    generation: int = 0
+    reason: str = "尚未检查当前目标"
+    source_sequence: int | None = None
+    received_at: float | None = None
+    frame_age: float | None = None
+    capture_ms: float | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +180,10 @@ class State(StrEnum):
     UNCONFIRMED = "结果未确认"
     PAUSED = "暂停"
     ERROR = "错误"
+    BACKGROUND = "后台等待"
+    WAITING_FOREGROUND = "等待切回"
+    ACTIVATING = "正在尝试切回"
+    REMINDED = "已提醒"
 
 
 @dataclass(frozen=True)
@@ -168,8 +197,15 @@ class Settings:
     round_timeout: float = 120.0
     verification_timeout: float = 5.0
     hotkey: str = "Ctrl+Alt+F11"
+    capture_method: str = "auto"
+    sound_enabled: bool = True
 
     def validate(self) -> None:
+        if (not isinstance(self.capture_method, str)
+                or self.capture_method not in {"auto", "wgc", "gdi"}):
+            raise ValueError("捕获方式必须为 auto、wgc 或 gdi")
+        if not isinstance(self.sound_enabled, bool):
+            raise ValueError("提示音设置必须为布尔值")
         limits = {
             "threshold": (0.8, 0.9999),
             "consecutive_frames": (2, 10),
@@ -201,6 +237,11 @@ class Snapshot:
     detection: Detection | None = None
     frame: Frame | None = None
     elapsed: float = 0.0
+    capture_status: CaptureStatus | None = None
+    foreground: bool | None = None
+    activation_allowed: bool = False
+    activation_attempted: bool = False
+    manual_paused: bool = False
 
 
 def preview_to_pixel(x: float, y: float, display: Rect, image_size: tuple[int, int]):

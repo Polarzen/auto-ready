@@ -133,7 +133,9 @@ def test_evidence_observer_cannot_bypass_final_gate_or_retry(change):
         clock.advance()
         engine.tick()
     assert len(adapter.points) == (1 if change == "observer_error" else 0)
-    assert engine.snapshot().state == State.UNCONFIRMED
+    # A stop at the final gate stays stopped; a late input result cannot undo it.
+    expected = State.DISARMED if change == "stop" else State.UNCONFIRMED
+    assert engine.snapshot().state == expected
 
 
 @pytest.mark.parametrize("args", [

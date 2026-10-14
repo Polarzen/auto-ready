@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import tempfile
@@ -79,6 +80,19 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
                         help="启动界面后自动关闭；不选择窗口、不发送输入")
     parser.add_argument("--verify-simulator", action="store_true",
                         help="打开受限模拟器验收；默认拒绝真实输入")
+    parser.add_argument(
+        "--capture-check",
+        action="store_true",
+        help="只读捕获本进程创建的标记窗口；不选择用户窗口或发送输入",
+    )
+    parser.add_argument(
+        "--capture-check-output", type=Path, help="写入 --capture-check 的 JSON 证据路径"
+    )
+    parser.add_argument(
+        "--capture-backend-check",
+        choices=("available", "unavailable"),
+        help="与 --smoke-test 一起检查捕获依赖导入路径，不创建目标窗口",
+    )
     parser.add_argument("--allow-real-input", action="store_true",
                         help="仅限受限模拟器；由用户现场明确允许真实输入")
     args = parser.parse_args(argv)
@@ -86,11 +100,59 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--allow-real-input 只能与 --verify-simulator 一起使用")
     if args.verify_simulator and (args.simulator or args.smoke_test):
         parser.error("--verify-simulator 不能与 --simulator 或 --smoke-test 混用")
+    if args.capture_check and (
+        args.simulator
+        or args.verify_simulator
+        or args.smoke_test
+        or args.allow_real_input
+        or args.capture_backend_check is not None
+    ):
+        parser.error("--capture-check 不能与模拟器、验证、smoke 或真实输入选项混用")
+    if args.capture_check_output is not None and not args.capture_check:
+        parser.error("--capture-check-output 只能与 --capture-check 一起使用")
+    if args.capture_backend_check is not None and not args.smoke_test:
+        parser.error("--capture-backend-check 只能与 --smoke-test 一起使用")
     return args
+
+
+def _check_capture_backend(mode: str) -> bool:
+    """Probe only the packaged/source capture dependency; never create a target."""
+    from .capture import probe_wgc_support
+
+    available, reason = probe_wgc_support(force_unavailable=(mode == "unavailable"))
+    expected = mode == "available"
+    result = {
+        "check": "capture_backend_import",
+        "expected": mode,
+        "available": available,
+        "status": "pass" if available is expected else "fail",
+        "reason": reason,
+        "target_created": False,
+        "capture_attempted": False,
+        "input_attempted": False,
+    }
+    if sys.stdout is not None:
+        try:
+            print(json.dumps(result, ensure_ascii=False))
+        except Exception:
+            pass
+    return available is expected
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _arguments(argv)
+    if args.capture_check:
+        from .capture_check import main as capture_check_main
+
+        forwarded = (
+            ["--output", str(args.capture_check_output)]
+            if args.capture_check_output is not None
+            else []
+        )
+        return capture_check_main(forwarded)
+    if args.capture_backend_check is not None:
+        if not _check_capture_backend(args.capture_backend_check):
+            return 2
     if args.verify_simulator:
         from .verification import main as verify_main
 
@@ -122,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     simulator_window = None
     window = None
     previous_excepthook = None
+    exit_code = 0
     try:
         from .native import SingleInstance, enable_dpi_awareness
 
@@ -192,29 +255,76 @@ def main(argv: list[str] | None = None) -> int:
                     simulator_window.close()
 
             QTimer.singleShot(120, close_smoke_windows)
-        return app.exec()
+        exit_code = app.exec()
     except Exception as exc:
         logging.getLogger("auto_ready").exception("Desktop startup failed")
         try:
             _show_error(f"请检查应用日志。启动失败：{exc}")
         except Exception:
             logging.getLogger("auto_ready").exception("Could not show startup error dialog")
-        return 2
+        exit_code = 2
     finally:
         if previous_excepthook is not None:
             sys.excepthook = previous_excepthook
-        try:
-            if window is not None:
-                close_and_wait(window)
-                logging.getLogger("auto_ready").info(
-                    "shutdown worker_running=%s attempted=%s", window.worker.isRunning(),
-                    window.engine.snapshot().attempted,
-                )
-        finally:
+        logger = logging.getLogger("auto_ready")
+        if window is not None:
             try:
-                if simulator_window is not None:
-                    simulator_window.close()
-            finally:
-                if instance is not None:
-                    instance.close()
-                _cleanup_temporary_root(temporary_root)
+                close_and_wait(window)
+            except Exception:
+                exit_code = 2
+                logger.exception("Desktop shutdown failed")
+            try:
+                worker_running = window.worker.isRunning()
+                release_errors: tuple[str, ...] = ()
+                if not worker_running:
+                    try:
+                        release_errors = window.worker.capture_release_errors()
+                    except Exception as exc:
+                        release_errors = (
+                            f"release status unavailable: {type(exc).__name__}: {exc}",
+                        )
+                if worker_running or release_errors:
+                    exit_code = 2
+                    if release_errors:
+                        logger.error(
+                            "Native capture teardown was not confirmed: %s",
+                            "; ".join(release_errors),
+                        )
+                    else:
+                        logger.error(
+                            "Native capture teardown was not confirmed because "
+                            "the worker is still running"
+                        )
+                capture_clean = not worker_running and not release_errors
+                try:
+                    attempted = window.engine.snapshot().attempted
+                except Exception:
+                    attempted = "unknown"
+                    logger.exception("Could not inspect engine state during shutdown")
+                    exit_code = 2
+                    capture_clean = False
+                logger.info(
+                    "shutdown worker_running=%s attempted=%s capture_clean=%s",
+                    worker_running, attempted, capture_clean,
+                )
+            except Exception:
+                exit_code = 2
+                logger.exception("Could not report UI shutdown state")
+        if simulator_window is not None:
+            try:
+                simulator_window.close()
+            except Exception:
+                exit_code = 2
+                logger.exception("Simulator shutdown failed")
+        if instance is not None:
+            try:
+                instance.close()
+            except Exception:
+                exit_code = 2
+                logger.exception("Single-instance cleanup failed")
+        try:
+            _cleanup_temporary_root(temporary_root)
+        except Exception:
+            exit_code = 2
+            logger.exception("Temporary-root cleanup failed")
+    return exit_code

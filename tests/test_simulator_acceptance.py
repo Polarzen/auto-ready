@@ -190,7 +190,7 @@ def _tick_until_reason(engine: Engine, clock: FakeClock, text: str, count: int =
 
 
 _CASES = (
-    ("reminder", State.UNCONFIRMED),
+    ("reminder", State.REMINDED),
     ("disarmed", State.DISARMED),
     ("stop", State.DISARMED),
     ("emergency_stop", State.DISARMED),

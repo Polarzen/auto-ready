@@ -222,7 +222,10 @@ class ConfigStore:
                 raise ValueError("settings 必须是对象")
             allowed_settings = {item.name for item in fields(Settings)}
             unknown_settings = set(settings_data) - allowed_settings
-            missing_settings = allowed_settings - set(settings_data)
+            # v0.3 profiles retain their original required fields. New optional
+            # preferences migrate in memory only; loading never rewrites a file.
+            optional_settings = {"capture_method", "sound_enabled"}
+            missing_settings = allowed_settings - optional_settings - set(settings_data)
             if unknown_settings or missing_settings:
                 raise ValueError(
                     f"settings 字段不匹配 (缺少: {sorted(missing_settings)}, "

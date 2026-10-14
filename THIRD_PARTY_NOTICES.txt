@@ -7,9 +7,12 @@ This application uses unmodified third-party binary libraries, loaded dynamicall
   https://code.qt.io/cgit/pyside/pyside-setup.git/?h=v6.10.3
   https://download.qt.io/archive/qt/6.10/6.10.3/
   https://doc.qt.io/qtforpython-6/licenses.html
-* OpenCV / opencv-python-headless: https://github.com/opencv/opencv-python
+* OpenCV / opencv-python: https://github.com/opencv/opencv-python
   OpenCV license and third-party notices are bundled under licenses/OpenCV.
 * NumPy: https://numpy.org/doc/stable/license.html
+* windows-capture 2.0.1 (MIT): https://github.com/NiiightmareXD/windows-capture
+  Uses Windows Graphics Capture and the system Direct3D/WinRT APIs.
+  The unmodified native extension and license are included in the candidate bundle.
 * PyInstaller bootloader: GPL with bootloader distribution exception.
   https://pyinstaller.org/en/stable/license.html
 

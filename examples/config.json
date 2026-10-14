@@ -9,7 +9,9 @@
     "position_tolerance": 3,
     "round_timeout": 120.0,
     "verification_timeout": 5.0,
-    "hotkey": "Ctrl+Alt+F11"
+    "hotkey": "Ctrl+Alt+F11",
+    "capture_method": "auto",
+    "sound_enabled": true
   },
   "region": {
     "x": 0.0,

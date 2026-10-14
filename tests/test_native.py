@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import queue
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -117,6 +118,12 @@ def test_input_refuses_cancelled_events_held_buttons_modifiers_and_outside_point
     assert not api.calls
 
     api.pressed.clear()
+    api.pressed.add(0x41)  # Ordinary held keys also block automatic input.
+    with pytest.raises(native.SafetyError, match="physical keyboard or mouse"):
+        native.WindowsInput(_api=api).click((-1920, -100), threading.Event())
+    assert not api.calls
+
+    api.pressed.clear()
     with pytest.raises(native.SafetyError, match="outside"):
         native.WindowsInput(_api=api).click((1920, 0), threading.Event())
     assert not api.calls
@@ -159,6 +166,14 @@ class FakeWindowAPI:
         self.event_log = []
         self.bitblt_args = []
         self.release_dc_args = []
+        self.extended_frame_bounds = (-102, 17, -58, 57)
+        self.pressed: set[int] = set()
+        self.foreground_requests = []
+        self.foreground_result = 1
+        self.foreground_queries = 0
+        self.foreground_hwnd = 1
+        self.minimized = False
+        self.qpc_frequency = 10_000_000
 
     @staticmethod
     def _contents(pointer, kind):
@@ -171,7 +186,7 @@ class FakeWindowAPI:
         return True
 
     def IsIconic(self, hwnd):
-        return False
+        return self.minimized and native._handle_value(hwnd) == 1
 
     def EnumWindows(self, callback, _lparam):
         return all(callback(native._handle(hwnd), 0) for hwnd in self.enumerated_windows)
@@ -225,6 +240,22 @@ class FakeWindowAPI:
         return {76: -1920, 77: -200, 78: 3840, 79: 2160}[metric]
 
     def GetForegroundWindow(self):
+        self.foreground_queries += 1
+        return self.foreground_hwnd
+
+    def SetForegroundWindow(self, hwnd):
+        self.foreground_requests.append(native._handle_value(hwnd))
+        return self.foreground_result
+
+    def GetAsyncKeyState(self, key):
+        return 0x8000 if key in self.pressed else 0
+
+    def QueryPerformanceFrequency(self, output):
+        self._contents(output, native._LONGLONG).value = self.qpc_frequency
+        return 1
+
+    def QueryPerformanceCounter(self, output):
+        self._contents(output, native._LONGLONG).value = time.perf_counter_ns() // 100
         return 1
 
     def GetGUIThreadInfo(self, _thread, info_pointer):
@@ -249,11 +280,17 @@ class FakeWindowAPI:
         return 1
 
     def DwmGetWindowAttribute(self, hwnd, attribute, output, size):
-        assert attribute == 14
-        assert size == ctypes.sizeof(native._DWORD)
-        self._contents(output, native._DWORD).value = int(
-            native._handle_value(hwnd) in self.cloaked
-        )
+        if attribute == 14:
+            assert size == ctypes.sizeof(native._DWORD)
+            self._contents(output, native._DWORD).value = int(
+                native._handle_value(hwnd) in self.cloaked
+            )
+        elif attribute == native._DWMWA_EXTENDED_FRAME_BOUNDS:
+            assert size == ctypes.sizeof(native._RECT)
+            bounds = self._contents(output, native._RECT)
+            bounds.left, bounds.top, bounds.right, bounds.bottom = self.extended_frame_bounds
+        else:
+            raise AssertionError(f"unexpected DWM attribute: {attribute}")
         return 0
 
     def GetDC(self, hwnd):
@@ -299,8 +336,9 @@ class FakeWindowAPI:
 def test_inspect_and_capture_return_stable_physical_bgr_frame_and_release_gdi(monkeypatch):
     api = FakeWindowAPI()
     backend = native.WindowsBackend(_api=api)
+    backend.set_capture_method("gdi")
     identity = Identity(1, 44, api.creation_time, api.process_path, "old title")
-    timestamps = iter((12.5, 19.0))
+    timestamps = iter((12.5, 13.0, 19.0, 19.5))
 
     def capture_time():
         api.event_log.append("timestamp")
@@ -344,25 +382,60 @@ def test_list_windows_builds_identity_from_hwnd_process_and_title():
 
 def test_capture_rejects_changed_geometry_after_releasing_gdi_resources():
     class MovingWindowAPI(FakeWindowAPI):
-        def __init__(self):
-            super().__init__()
-            self.inspect_count = 0
-
-        def GetClientRect(self, hwnd, rect_pointer):
-            self.inspect_count += 1
-            if self.inspect_count > 1:
-                self.client_size = (41, 30)
-                self.gdi_bytes = bytes([3, 7, 11, 0] * (41 * 30))
-            return super().GetClientRect(hwnd, rect_pointer)
+        def BitBlt(self, *_args):
+            result = super().BitBlt(*_args)
+            self.client_size = (41, 30)
+            self.gdi_bytes = bytes([3, 7, 11, 0] * (41 * 30))
+            return result
 
     api = MovingWindowAPI()
     backend = native.WindowsBackend(_api=api)
+    backend.set_capture_method("gdi")
     identity = Identity(1, 44, api.creation_time, api.process_path)
 
     with pytest.raises(native.SafetyError, match="changed during capture"):
         backend.capture(identity, "session")
 
     assert {"bitmap", "memory_dc", "source_dc"}.issubset(api.released)
+
+
+@pytest.mark.parametrize("reason", ["foreground", "occluded"])
+def test_gdi_capture_refuses_nonforeground_or_occluded_client_before_bitblt(reason):
+    api = FakeWindowAPI()
+    if reason == "foreground":
+        api.foreground_hwnd = 2
+    else:
+        api.window_rects[2] = (-101, 19, -90, 30)
+    backend = native.WindowsBackend(_api=api)
+    backend.set_capture_method("gdi")
+    identity = Identity(1, 44, api.creation_time, api.process_path)
+
+    with pytest.raises(native.SafetyError):
+        backend.capture(identity, "session")
+
+    assert api.bitblt_args == []
+
+
+@pytest.mark.parametrize("change", ["foreground", "occlusion"])
+def test_gdi_capture_discards_frame_if_focus_or_full_client_visibility_changes(change):
+    class ChangingAPI(FakeWindowAPI):
+        def BitBlt(self, *args):
+            result = super().BitBlt(*args)
+            if change == "foreground":
+                self.foreground_hwnd = 2
+            else:
+                self.window_rects[2] = (-101, 19, -90, 30)
+            return result
+
+    api = ChangingAPI()
+    backend = native.WindowsBackend(_api=api)
+    backend.set_capture_method("gdi")
+    identity = Identity(1, 44, api.creation_time, api.process_path)
+
+    with pytest.raises(native.SafetyError, match="前台|遮挡"):
+        backend.capture(identity, "session")
+
+    assert len(api.bitblt_args) == 1
 
 
 def test_bitblt_failure_still_releases_all_created_gdi_resources():
@@ -372,6 +445,7 @@ def test_bitblt_failure_still_releases_all_created_gdi_resources():
 
     api = FailedBltAPI()
     backend = native.WindowsBackend(_api=api)
+    backend.set_capture_method("gdi")
     identity = Identity(1, 44, api.creation_time, api.process_path)
 
     with pytest.raises(native.SafetyError, match="BitBlt"):
@@ -419,6 +493,34 @@ def test_unobscured_checks_visible_uncloaked_windows_above_target():
     api.window_rects[2] = (-101, 19, -90, 30)
     api.cloaked.add(2)
     assert backend.unobscured(identity, target, geometry)
+
+
+def test_request_foreground_uses_one_ordinary_call_and_leaves_verification_to_caller():
+    api = FakeWindowAPI()
+    api.foreground_hwnd = 2
+    backend = native.WindowsBackend(_api=api)
+    identity = Identity(1, 44, api.creation_time, api.process_path)
+
+    assert backend.request_foreground(identity, threading.Event())
+    assert api.foreground_requests == [1]
+    assert api.foreground_queries == 0
+
+    assert not backend.foreground(identity)
+    assert api.foreground_queries == 1
+
+
+def test_request_foreground_refuses_cancelled_or_conflicting_input_without_calling_api():
+    api = FakeWindowAPI()
+    backend = native.WindowsBackend(_api=api)
+    identity = Identity(1, 44, api.creation_time, api.process_path)
+    cancelled = threading.Event()
+    cancelled.set()
+    assert not backend.request_foreground(identity, cancelled)
+    assert not api.foreground_requests
+
+    api.pressed.add(0x41)
+    assert not backend.request_foreground(identity, threading.Event())
+    assert not api.foreground_requests
 
 
 def test_moving_reports_gui_move_size_state_and_fails_closed_on_query_failure():

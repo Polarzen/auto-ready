@@ -24,6 +24,38 @@ def test_missing_config_uses_disarmed_defaults(tmp_path):
     assert success is None
 
 
+def test_v030_settings_migrate_only_in_memory(tmp_path):
+    store = ConfigStore(tmp_path)
+    store.save(Settings(), Region(), make_template(), None)
+    document = json.loads(store.config_path.read_text(encoding="utf-8"))
+    document["settings"].pop("capture_method")
+    document["settings"].pop("sound_enabled")
+    store.config_path.write_text(json.dumps(document), encoding="utf-8")
+    before = store.config_path.read_bytes()
+    settings, _, button, _ = store.load()
+    assert settings.capture_method == "auto"
+    assert settings.sound_enabled is True
+    assert button is not None
+    assert store.config_path.read_bytes() == before
+
+
+def test_new_capture_preferences_round_trip_without_authority(tmp_path):
+    store = ConfigStore(tmp_path)
+    settings = Settings(capture_method="gdi", sound_enabled=False)
+    store.save(settings, Region(), make_template(), None)
+    assert store.load()[0] == settings
+    data = json.loads(store.config_path.read_text(encoding="utf-8"))
+    assert not ({"identity", "hwnd", "pid", "mode", "allow_activation", "session"}
+                & set(data["settings"]))
+    for key, value in (("capture_method", "unknown"), ("sound_enabled", "yes")):
+        original = data["settings"][key]
+        data["settings"][key] = value
+        store.config_path.write_text(json.dumps(data), encoding="utf-8")
+        with pytest.raises(ValueError):
+            store.load()
+        data["settings"][key] = original
+
+
 def test_round_trip_stores_pngs_and_only_configuration(tmp_path):
     store = ConfigStore(tmp_path)
     settings = Settings(threshold=0.95, hotkey="Ctrl+Alt+F11")

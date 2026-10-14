@@ -4,7 +4,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 
-from auto_ready.simulator import SimulatorWindow
+from auto_ready.simulator import CaptureProbeWindow, SimulatorWindow
 
 
 def test_simulator_delay_and_manual_ready(qtbot):
@@ -89,3 +89,32 @@ def test_simulator_expiry_hides_ready_button(qtbot):
 
     qtbot.waitUntil(lambda: window.state == "expired", timeout=1800)
     assert not window.ready_button.isVisible()
+
+
+def test_simulator_shows_a_visible_incrementing_capture_marker(qtbot):
+    window = SimulatorWindow(evidence_source="test_fake")
+    qtbot.addWidget(window)
+    window.show()
+
+    starting_counter = window.capture_marker.counter
+    assert window.capture_marker.isVisible()
+    qtbot.waitUntil(lambda: window.capture_marker.counter > starting_counter, timeout=1000)
+
+
+def test_capture_probe_minimize_and_restore_use_nonactivating_show_commands(qtbot, monkeypatch):
+    commands = []
+    monkeypatch.setattr(
+        "auto_ready.simulator._show_window",
+        lambda hwnd, command: commands.append((int(hwnd), command)),
+    )
+    window = CaptureProbeWindow()
+    qtbot.addWidget(window)
+    window.show()
+
+    window.minimize_without_activation()
+    window.restore_without_activation()
+
+    assert commands == [
+        (int(window.winId()), 7),  # SW_SHOWMINNOACTIVE
+        (int(window.winId()), 4),  # SW_SHOWNOACTIVATE
+    ]

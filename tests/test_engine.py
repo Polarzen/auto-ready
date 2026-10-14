@@ -38,6 +38,7 @@ class Backend:
         self.image[80:104, 120:180] = pattern()
         self.on_capture = None
         self.frame_transform = lambda f: f
+        self.queued_frames = []
 
     def inspect(self, identity):
         if not self.valid or identity != self.identity:
@@ -54,6 +55,8 @@ class Backend:
         return self.clear
 
     def capture(self, identity, session_id):
+        if self.queued_frames:
+            return self.queued_frames.pop(0)
         self.sequence += 1
         # A new actual capture has a newer timestamp, even during final recapture.
         self.clock.advance(0.001)
@@ -192,7 +195,8 @@ def test_reminder_dedup_never_invokes_real_input(rig):
     engine.configure(engine.identity, engine.button, mode=Mode.REMIND)
     engine.set_hotkey_available(False)
     engine.start()
-    run(rig, 30)
+    snapshot = run(rig, 30)
+    assert snapshot.state == State.REMINDED
     assert not adapter.points
     assert sounds == [True]
 
@@ -201,11 +205,28 @@ def test_manual_pause_requires_resume(rig):
     engine, _, adapter, _, _ = rig
     engine.start()
     engine.pause()
-    assert run(rig).state == State.PAUSED
+    snapshot = run(rig)
+    assert snapshot.state == State.PAUSED
+    assert snapshot.manual_paused is True
     assert not adapter.points
     engine.resume()
+    assert engine.snapshot().manual_paused is False
     run(rig)
     assert len(adapter.points) == 1
+
+
+def test_stop_clears_manual_pause_snapshot_state(rig):
+    engine, _, _, _, _ = rig
+    engine.start()
+    engine.pause()
+    assert engine.snapshot().manual_paused is True
+
+    engine.stop()
+
+    assert engine.snapshot().state == State.DISARMED
+    assert engine.snapshot().manual_paused is False
+    assert engine._manual_pause is False
+    assert engine._pause_requested.is_set() is False
 
 
 @pytest.mark.parametrize("action", ["stop", "close", "hotkey", "configure"])
@@ -261,6 +282,51 @@ def test_success_requires_positive_template_and_two_new_frames(rig):
     backend.image[150:174, 20:80] = pattern(99)
     run(rig, 2)
     assert engine.snapshot().state == State.SUCCESS
+    assert len(adapter.points) == 1
+
+
+def test_success_frames_captured_during_delayed_click_do_not_confirm(rig):
+    engine, backend, adapter, _, clock = rig
+    success = Template(pattern(99), (320, 240), 96, "成功")
+    engine.configure(
+        engine.identity,
+        engine.button,
+        success,
+        settings=Settings(max_frame_age=0.5, verification_timeout=1.0),
+        mode=Mode.AUTO,
+    )
+    engine.start()
+    capture = backend.capture
+
+    def delayed_click(point, cancelled):
+        assert not cancelled.is_set()
+        backend.image[150:174, 20:80] = pattern(99)
+        clock.advance(0.13)
+        during_click = [capture(engine.identity, engine.snapshot().session_id) for _ in range(2)]
+        backend.queued_frames.extend(during_click)
+        clock.advance(0.02)
+        adapter.points.append(point)
+
+    adapter.click = delayed_click
+    for _ in range(12):
+        clock.advance()
+        engine.tick()
+        if adapter.points:
+            break
+
+    assert len(adapter.points) == 1
+    assert engine.snapshot().state == State.VERIFYING
+    attempted_at = engine._attempted_at
+    for _ in range(2):
+        clock.advance(0.1)
+        snapshot = engine.tick()
+    assert snapshot.state == State.VERIFYING
+    assert engine._success_count == 0
+    assert engine._attempted_at == attempted_at
+
+    clock.advance(0.65)
+    snapshot = engine.tick()
+    assert snapshot.state == State.UNCONFIRMED
     assert len(adapter.points) == 1
 
 

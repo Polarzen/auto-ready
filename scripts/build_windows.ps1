@@ -79,11 +79,14 @@ try {
     $metadataRoot = Join-Path $projectRoot "build\metadata"
     [void](New-Item -ItemType Directory -Path $metadataRoot -Force)
     $buildInfoPath = Join-Path $metadataRoot "build-info.json"
+    Invoke-Checked $python @((Join-Path $PSScriptRoot "source_snapshot.py"), $metadataRoot) "source snapshot"
+    $sourceSnapshot = Get-Content -LiteralPath (Join-Path $metadataRoot "source-snapshot.json") -Raw | ConvertFrom-Json
     [ordered]@{
         schema_version = 1
         application_version = $appVersion.Trim()
         source_commit = $sourceCommit
         source_dirty = ($sourceState.Count -gt 0)
+        source_snapshot_sha256 = $sourceSnapshot.sha256
         built_at_utc = [DateTime]::UtcNow.ToString("o")
         python = $runtime.Trim()
         build_verification = "startup_only_no_real_input"
@@ -103,6 +106,7 @@ try {
         "--paths", $sourceRoot,
         "--hidden-import", "auto_ready.simulator",
         "--hidden-import", "auto_ready.verification",
+        "--collect-all", "windows_capture",
         "--add-data", "$buildInfoPath;.",
         "--add-data", "$readme;.",
         "--add-data", "$exampleConfig;examples"
@@ -132,7 +136,8 @@ try {
         @{ Filter = "pyside6_essentials-*.dist-info"; Destination = "PySide6-Essentials" },
         @{ Filter = "shiboken6-*.dist-info"; Destination = "Shiboken6" },
         @{ Filter = "pyinstaller-*.dist-info"; Destination = "PyInstaller" },
-        @{ Filter = "numpy-*.dist-info"; Destination = "NumPy" }
+        @{ Filter = "numpy-*.dist-info"; Destination = "NumPy" },
+        @{ Filter = "windows_capture-*.dist-info"; Destination = "windows-capture" }
     )
     foreach ($package in $licensePackages) {
         $distribution = Get-ChildItem -LiteralPath $sitePackages -Directory `
@@ -182,19 +187,40 @@ try {
     # Keep user-facing instructions beside the executable, not only in _internal.
     $bundleRoot = Split-Path -Parent $application
     Copy-Item -LiteralPath $buildInfoPath -Destination $bundleRoot
-    foreach ($document in @("README.md", "STATUS.md", "THIRD_PARTY_NOTICES.txt", "requirements-windows.lock.txt")) {
+    Copy-Item -LiteralPath (Join-Path $metadataRoot "source-snapshot.zip") -Destination $bundleRoot
+    Copy-Item -LiteralPath (Join-Path $metadataRoot "source-snapshot.json") -Destination $bundleRoot
+    foreach ($document in @("README.md", "STATUS.md", "ARCHITECTURE.md", "THIRD_PARTY_NOTICES.txt", "requirements-windows.lock.txt")) {
         Copy-Item -LiteralPath (Join-Path $projectRoot $document) -Destination $bundleRoot
     }
     Copy-Item -LiteralPath (Join-Path $projectRoot "examples") -Destination $bundleRoot -Recurse -Force
-    Write-Host "Running packaged --smoke-test startup check..."
-    $smokeProcess = Start-Process -FilePath $application -ArgumentList @("--smoke-test") `
-        -PassThru -WindowStyle Hidden
-    if (-not $smokeProcess.WaitForExit(30000)) {
-        $smokeProcess.Kill()
-        throw "Packaged smoke test did not exit within 30 seconds."
+    Copy-Item -LiteralPath (Join-Path $projectRoot "docs") -Destination $bundleRoot -Recurse -Force
+    foreach ($requiredCaptureFile in @(
+        "_internal\windows_capture\windows_capture.pyd",
+        "_internal\licenses\windows-capture\LICENCE"
+    )) {
+        if (-not (Test-Path -LiteralPath (Join-Path $bundleRoot $requiredCaptureFile) -PathType Leaf)) {
+            throw "Missing packaged capture dependency or license: $requiredCaptureFile"
+        }
     }
-    if ($smokeProcess.ExitCode -ne 0) {
-        throw "Packaged smoke test failed with exit code $($smokeProcess.ExitCode)."
+    $savedSmokeQtPlatform = $env:QT_QPA_PLATFORM
+    try {
+      $env:QT_QPA_PLATFORM = "offscreen"
+      foreach ($captureMode in @("available", "unavailable")) {
+        Write-Host "Running packaged no-input startup/exit check: capture $captureMode..."
+        $smokeProcess = Start-Process -FilePath $application `
+            -ArgumentList @("--smoke-test", "--capture-backend-check", $captureMode) `
+            -PassThru -WindowStyle Hidden
+        if (-not $smokeProcess.WaitForExit(30000)) {
+            $smokeProcess.Kill()
+            throw "Packaged smoke test ($captureMode) did not exit within 30 seconds."
+        }
+        if ($smokeProcess.ExitCode -ne 0) {
+            throw "Packaged smoke test ($captureMode) failed: $($smokeProcess.ExitCode)."
+        }
+      }
+    }
+    finally {
+        $env:QT_QPA_PLATFORM = $savedSmokeQtPlatform
     }
 
     if ($Zip) {

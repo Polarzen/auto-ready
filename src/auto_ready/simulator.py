@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -21,6 +22,158 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+_MARKER_COLORS = (
+    QColor("#ff2424"),  # top-left
+    QColor("#16e070"),  # top-right
+    QColor("#287dff"),  # bottom-left
+    QColor("#ffdb28"),  # bottom-right
+)
+_SW_SHOWMINNOACTIVE = 7
+_SW_SHOWNOACTIVATE = 4
+
+
+def _show_window(hwnd: int, command: int) -> None:
+    """Apply a nonactivating native show command to one of our own windows."""
+    if sys.platform != "win32":
+        return
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    show_window = user32.ShowWindow
+    show_window.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    show_window.restype = ctypes.c_int
+    show_window(ctypes.c_void_p(int(hwnd)), command)
+
+
+class CaptureMarkerWidget(QWidget):
+    """Visible, changing source marker shared by the simulator and WGC probe."""
+
+    def __init__(self, parent: QWidget | None = None, *, frozen: bool = False):
+        super().__init__(parent)
+        self.setObjectName("captureMarker")
+        self.setMinimumHeight(76)
+        self._counter = 0
+        self._frozen = frozen
+        self._timer = QTimer(self)
+        self._timer.setInterval(160)
+        self._timer.timeout.connect(self._advance)
+        if not frozen:
+            self._timer.start()
+
+    @property
+    def counter(self) -> int:
+        return self._counter
+
+    def set_frozen(self, frozen: bool) -> None:
+        self._frozen = frozen
+        if frozen:
+            self._timer.stop()
+        else:
+            self._timer.start()
+
+    def _advance(self) -> None:
+        if self._frozen:
+            return
+        self._counter = (self._counter + 1) & 0xFFFF
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt virtual method spelling
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        bounds = self.rect()
+        painter.fillRect(bounds, QColor("#101820"))
+
+        side = max(8, int(min(bounds.width(), bounds.height()) * 0.42))
+        margin_x = max(3, int(bounds.width() * 0.025))
+        margin_y = max(3, int(bounds.height() * 0.08))
+        corner_rects = (
+            (margin_x, margin_y),
+            (bounds.width() - margin_x - side, margin_y),
+            (margin_x, bounds.height() - margin_y - side),
+            (bounds.width() - margin_x - side, bounds.height() - margin_y - side),
+        )
+        for color, (x, y) in zip(_MARKER_COLORS, corner_rects, strict=True):
+            painter.fillRect(x, y, side, side, color)
+
+        cell_w = max(2, int(bounds.width() * 0.031))
+        gap = max(1, int(bounds.width() * 0.009))
+        cell_h = max(6, int(bounds.height() * 0.25))
+        total_w = 16 * cell_w + 15 * gap
+        start_x = (bounds.width() - total_w) // 2
+        start_y = (bounds.height() - cell_h) // 2
+        for index in range(16):
+            bit = (self._counter >> (15 - index)) & 1
+            color = QColor("#f4f1d0") if bit else QColor("#28333d")
+            painter.fillRect(start_x + index * (cell_w + gap), start_y, cell_w, cell_h, color)
+
+        if bounds.height() >= 90:
+            painter.setPen(QColor("#e8edf2"))
+            painter.drawText(
+                bounds.adjusted(0, int(bounds.height() * 0.28), 0, 0),
+                Qt.AlignmentFlag.AlignCenter,
+                f"CAPTURE SOURCE  {self._counter:05d}",
+            )
+        pen = QPen(QColor("#ff22c8"), max(2, int(min(bounds.width(), bounds.height()) * 0.025)))
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(bounds.adjusted(2, 2, -3, -3))
+
+
+class CaptureProbeWindow(QWidget):
+    """Own, non-activating marker target used only by the capture acceptance probe."""
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus,
+        )
+        self.setObjectName("captureProbeWindow")
+        self.setWindowTitle("Auto Ready Capture Check Marker")
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.resize(640, 360)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.marker = CaptureMarkerWidget(self)
+        layout.addWidget(self.marker)
+
+    def minimize_without_activation(self) -> None:
+        """Minimize this own-window target without making it foreground."""
+        _show_window(self.winId(), _SW_SHOWMINNOACTIVE)
+        if sys.platform != "win32":
+            self.setWindowState(Qt.WindowState.WindowMinimized)
+        self.update()
+
+    def restore_without_activation(self) -> None:
+        """Restore this own-window target without making it foreground."""
+        _show_window(self.winId(), _SW_SHOWNOACTIVATE)
+        if sys.platform != "win32":
+            self.setWindowState(Qt.WindowState.WindowNoState)
+        self.update()
+
+
+class CaptureOccluderWindow(QWidget):
+    """Magenta window placed over only the probe's own marker during one phase."""
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus,
+        )
+        self.setObjectName("captureProbeOccluder")
+        self.setWindowTitle("Auto Ready Capture Check Occluder")
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt virtual method spelling
+        del event
+        QPainter(self).fillRect(self.rect(), QColor("#ff00ff"))
 
 
 class ReadyButton(QPushButton):
@@ -164,6 +317,9 @@ class SimulatorWindow(QMainWindow):
     def _make_ui(self) -> None:
         root = QWidget(self)
         layout = QVBoxLayout(root)
+
+        self.capture_marker = CaptureMarkerWidget(root)
+        layout.addWidget(self.capture_marker)
 
         heading = QLabel("模拟游戏准备画面")
         heading.setObjectName("simulatorHeading")

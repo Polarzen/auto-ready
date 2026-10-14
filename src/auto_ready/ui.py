@@ -22,10 +22,12 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -33,9 +35,14 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
+    QStyle,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -84,6 +91,8 @@ class _IOWorker(QThread):
         self._next_id = 0
         self._semantic_revision = 0
         self._authorization_epoch = 0
+        self._capture_may_be_active = False
+        self._capture_release_errors: deque[str] = deque(maxlen=8)
         self._cancel = threading.Event()
 
     def submit(self, action: str, payload: Any = None) -> int | None:
@@ -111,6 +120,14 @@ class _IOWorker(QThread):
         with self._lock:
             self._semantic_revision = revision
 
+    def notification_context(self) -> tuple[int, int]:
+        with self._lock:
+            return self._semantic_revision, self._authorization_epoch
+
+    def capture_release_errors(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._capture_release_errors)
+
     def take_results(self) -> list[_WorkerResult]:
         with self._lock:
             results = list(self._results)
@@ -134,7 +151,9 @@ class _IOWorker(QThread):
 
     def _record_result(self, result: _WorkerResult) -> None:
         with self._lock:
-            if result.action in {"load_config", "save_config", "save_config_as"}:
+            if result.action in {
+                "load_config", "save_config", "save_config_as", "wizard_save"
+            }:
                 self._profile_result = result
             else:
                 self._results.append(result)
@@ -158,33 +177,95 @@ class _IOWorker(QThread):
             if self._cancel.is_set():
                 raise RuntimeError("采集已取消")
             geometry = self._backend.inspect(identity)
+            self._capture_may_be_active = True
             frame = self._backend.capture(identity, str(uuid.uuid4()))
             return frame, geometry
+        if action == "wizard_targets":
+            own_hwnd = int(payload)
+            return [item for item in self._backend.list_windows() if item.hwnd != own_hwnd]
+        if action == "wizard_inspect":
+            identity: Identity = payload
+            return identity, self._backend.inspect(identity)
+        if action == "wizard_capture":
+            identity, delay = payload
+            if delay and self._cancel.wait(delay):
+                raise RuntimeError("采集已取消")
+            if self._cancel.is_set():
+                raise RuntimeError("采集已取消")
+            geometry = self._backend.inspect(identity)
+            self._capture_may_be_active = True
+            frame = self._backend.capture(identity, str(uuid.uuid4()))
+            return identity, frame, geometry
+        if action == "wizard_recognize":
+            identity, button, region, settings, revision, draft_revision = payload
+            with self._lock:
+                if revision != self._semantic_revision:
+                    raise RuntimeError("设置已更改，已取消过期识别检查")
+            geometry = self._backend.inspect(identity)
+            self._capture_may_be_active = True
+            frame = self._backend.capture(identity, str(uuid.uuid4()))
+            if frame.identity != identity or frame.geometry != geometry:
+                raise RuntimeError("目标窗口或客户区已变化，请重新获取画面")
+            from .recognition import match
+
+            return identity, draft_revision, match(frame, button, region, settings)
+        if action == "wizard_save":
+            path, settings, region, button, success = payload
+            if path is None:
+                self._store.save(settings, region, button, success)
+            else:
+                profile_path = Path(path)
+                if profile_path.exists():
+                    raise ValueError("该名称的配置已存在；请选择另一个名称以保留旧配置。")
+                self._store.save_to(profile_path, settings, region, button, success)
+            return path
+        if action == "list_profiles":
+            roots = tuple(Path(root) for root in payload if root is not None)
+            profiles: dict[Path, str] = {}
+            for root in roots:
+                try:
+                    for path in root.glob("*.json"):
+                        if path.is_file():
+                            profiles[path.resolve()] = path.stem
+                except OSError:
+                    continue
+            return sorted(profiles.items(), key=lambda item: (item[1].casefold(), str(item[0])))
+        if action == "set_capture_method":
+            setter = getattr(self._backend, "set_capture_method", None)
+            if setter is None:
+                return "当前后端不支持切换捕获方式"
+            if not self._release_capture():
+                raise RuntimeError("原捕获资源释放失败，未切换捕获方式")
+            return setter(payload)
         if action == "preview":
             revision = payload
             with self._lock:
                 if revision != self._semantic_revision:
                     raise RuntimeError("识别设置已更改，已取消过期预览")
+            self._capture_may_be_active = True
             snapshot = self._engine.preview()
             with self._lock:
                 if revision != self._semantic_revision:
                     return None
             return revision, snapshot
         if action == "start":
-            revision, authorization_epoch = payload
+            (revision, allow_activation), authorization_epoch = payload
             self._refresh_hotkey_availability()
             with self._lock:
                 if (revision != self._semantic_revision
                         or authorization_epoch != self._authorization_epoch):
                     raise RuntimeError("识别设置已更改，已取消排队中的开始操作")
-            session_id = self._engine.start()
+            session_id = (
+                self._engine.start(allow_activation=True)
+                if allow_activation else self._engine.start()
+            )
             with self._lock:
                 stale = (revision != self._semantic_revision
                          or authorization_epoch != self._authorization_epoch)
             if stale:
                 self._engine.stop("识别设置已更改，已取消排队中的开始操作")
                 raise RuntimeError("识别设置已更改，已取消排队中的开始操作")
-            return revision, session_id
+            return revision, session_id, allow_activation
         if action == "save_config":
             path, revision, settings, region, button, success = payload
             default_path = getattr(self._store, "config_path", None)
@@ -208,11 +289,34 @@ class _IOWorker(QThread):
 
             return identity, revision, template_kind, load_template(Path(path), geometry)
         if action == "test_sound":
-            self._notifier()
+            self._notifier("测试提示音")
             return "已播放系统提示音"
         raise ValueError(f"未知后台操作：{action}")
 
+    def _release_capture(self) -> bool:
+        if not self._capture_may_be_active:
+            return True
+        release = getattr(self._backend, "release_capture", None)
+        self._capture_may_be_active = False
+        if release is None:
+            return True
+        try:
+            release()
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            with self._lock:
+                self._capture_release_errors.append(message)
+            self._record_result(_WorkerResult(0, "capture_release", error=message))
+            return False
+        return True
+
     def run(self) -> None:
+        try:
+            self._run_loop()
+        finally:
+            self._release_capture()
+
+    def _run_loop(self) -> None:
         next_tick = 0.0
         while not self._cancel.is_set() and not self.isInterruptionRequested():
             try:
@@ -238,12 +342,27 @@ class _IOWorker(QThread):
             now = time.monotonic()
             if now >= next_tick:
                 try:
+                    before = self._engine.snapshot()
+                    if (before.session_id and before.state not in TERMINAL
+                            and not (before.state == State.PAUSED and before.manual_paused)):
+                        self._capture_may_be_active = True
                     snapshot = self._engine.tick()
                 except Exception as exc:
                     self._record_result(_WorkerResult(0, "tick", error=str(exc)))
                 else:
+                    status_probe = getattr(self._backend, "capture_status", None)
+                    if status_probe is not None:
+                        try:
+                            status = status_probe()
+                            if status is not None:
+                                snapshot = replace(snapshot, capture_status=status)
+                        except Exception:
+                            pass
                     with self._lock:
                         self._snapshot = snapshot
+                    if (snapshot.state in TERMINAL
+                            or (snapshot.state == State.PAUSED and snapshot.manual_paused)):
+                        self._release_capture()
                 next_tick = time.monotonic() + max(
                     0.05, float(self._engine.settings.poll_seconds)
                 )
@@ -361,6 +480,7 @@ class MainWindow(QMainWindow):
     """The explicit target → collect → preview → mode → manual start workflow."""
 
     emergencyStop = Signal()
+    notificationRequested = Signal(str, str, str, int, int)
 
     def __init__(self, backend: Any = None, input_adapter: Any = None, store: Any = None,
                  hotkey_factory: Any = None, *, notifier: Any = None, capture_delay: float = 3.0):
@@ -369,11 +489,12 @@ class MainWindow(QMainWindow):
         from .native import GlobalHotkey, WindowsBackend, WindowsInput, hotkey_policy_reason
         from .sound import notify
 
-        self.setWindowTitle("Auto Ready · 开始前逐项确认")
-        self.resize(1060, 760)
+        self.setWindowTitle("Auto Ready · 等待游戏就绪")
+        self.resize(760, 560)
         self.backend = backend if backend is not None else WindowsBackend()
         self.store = store if store is not None else ConfigStore()
-        self._notifier = notifier if notifier is not None else notify
+        self._sound_notifier = notifier if notifier is not None else notify
+        self._notifier = self._emit_notification
         self._hotkey_policy_reason = hotkey_policy_reason
         input_adapter = input_adapter if input_adapter is not None else WindowsInput()
         self._hotkey_factory = hotkey_factory or (
@@ -392,6 +513,7 @@ class MainWindow(QMainWindow):
         self._semantic_revision = 0
         self._pending_start_request: int | None = None
         self._pending_capture_request: int | None = None
+        self._capture_clears_selections = False
         self._pending_import_request: int | None = None
         self._pending_profile_request: int | None = None
         self._pending_profile_action: str | None = None
@@ -406,6 +528,20 @@ class MainWindow(QMainWindow):
         self._shutdown_started = False
         self._shutdown_poll_timer: QTimer | None = None
         self._manual_pause_requested = False
+        self._allow_activation_round = False
+        self._profile_paths: dict[str, Path] = {}
+        self._pending_profile_switch: Path | None = None
+        self._saved_config_signature: tuple[Any, ...] | None = None
+        self._capture_backend_name = "unselected"
+        self._wizard: Any = None
+        self._wizard_request: int | None = None
+        self._wizard_action: str | None = None
+        self._wizard_pending_identity: Identity | None = None
+        self._wizard_revision = 0
+        self._wizard_save_path: Path | None = None
+        self._tray_icon: QSystemTrayIcon | None = None
+        self._tray_status_action: QAction | None = None
+        self._last_dashboard_status: tuple[State, str] | None = None
 
         self.engine = Engine(self.backend, input_adapter, self._notifier)
         self.worker = _IOWorker(
@@ -417,6 +553,7 @@ class MainWindow(QMainWindow):
         )
         try:
             self.emergencyStop.connect(self._show_emergency_stop)
+            self.notificationRequested.connect(self._show_notification)
             self._build_ui()
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._refresh_worker_state)
@@ -424,6 +561,7 @@ class MainWindow(QMainWindow):
             self.worker.start()
             self._timer.start(80)
             QTimer.singleShot(0, self.refresh_targets)
+            QTimer.singleShot(0, self._refresh_profiles)
         except Exception:
             self.engine.close()
             self.worker.shutdown()
@@ -482,11 +620,14 @@ class MainWindow(QMainWindow):
         self.state_label.setWordWrap(True)
         self.status_label = QLabel("请选择目标窗口；启动时不会恢复上次窗口绑定。")
         self.status_label.setWordWrap(True)
+        self.capture_status_label = QLabel("捕获能力和当前画面状态见此处。")
+        self.capture_status_label.setWordWrap(True)
         self.candidates_text = QPlainTextEdit()
         self.candidates_text.setReadOnly(True)
         self.candidates_text.setMaximumBlockCount(100)
         diagnostics_layout.addWidget(self.state_label)
         diagnostics_layout.addWidget(self.status_label)
+        diagnostics_layout.addWidget(self.capture_status_label)
         diagnostics_layout.addWidget(self.candidates_text)
         left.addWidget(diagnostics, 1)
         workflow.addLayout(left, 3)
@@ -540,11 +681,19 @@ class MainWindow(QMainWindow):
         self.hotkey_combo.setEditable(True)
         self.hotkey_combo.addItems(["Ctrl+Alt+F11", "Ctrl+Shift+F11", "Ctrl+Alt+F10"])
         self.hotkey_combo.setCurrentText(self.settings.hotkey)
+        self.capture_method_combo = QComboBox()
+        self.capture_method_combo.addItem("自动选择", "auto")
+        self.capture_method_combo.addItem("Windows Graphics Capture", "wgc")
+        self.capture_method_combo.addItem("前台兼容捕获（GDI）", "gdi")
+        self.sound_enabled_checkbox = QCheckBox("发现按钮时播放提示音")
+        self.sound_enabled_checkbox.setChecked(self.settings.sound_enabled)
         self.threshold_spin.valueChanged.connect(self._settings_changed)
         self.frames_spin.valueChanged.connect(self._settings_changed)
         self.stable_spin.valueChanged.connect(self._settings_changed)
         self.timeout_spin.valueChanged.connect(self._settings_changed)
         self.hotkey_combo.currentTextChanged.connect(self._settings_changed)
+        self.capture_method_combo.currentIndexChanged.connect(self._settings_changed)
+        self.sound_enabled_checkbox.toggled.connect(self._settings_changed)
         self.hotkey_status_label = QLabel("正在注册全局停止键…")
         self.hotkey_status_label.setWordWrap(True)
         settings_form.addRow("最低匹配分数", self.threshold_spin)
@@ -553,6 +702,8 @@ class MainWindow(QMainWindow):
         settings_form.addRow("本轮超时", self.timeout_spin)
         settings_form.addRow("全局停止键", self.hotkey_combo)
         settings_form.addRow("停止键状态", self.hotkey_status_label)
+        settings_form.addRow("捕获方式", self.capture_method_combo)
+        settings_form.addRow(self.sound_enabled_checkbox)
         right.addWidget(settings_box)
 
         config_box = QGroupBox("配置与提示音")
@@ -580,7 +731,523 @@ class MainWindow(QMainWindow):
         right.addStretch(1)
         workflow.addLayout(right, 2)
         outer.addLayout(workflow, 1)
-        self.setCentralWidget(central)
+        self._build_compact_dashboard(central)
+        self._update_controls()
+
+    def _build_compact_dashboard(self, advanced_content: QWidget) -> None:
+        """Move the existing detailed controls behind one scrollable dialog."""
+        dashboard = QWidget(self)
+        root_layout = QVBoxLayout(dashboard)
+        scroll = QScrollArea(dashboard)
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        outer = QVBoxLayout(content)
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("配置"))
+        self.profile_combo = QComboBox()
+        self.profile_combo.addItem("默认配置", None)
+        self.profile_combo.currentIndexChanged.connect(self._profile_combo_changed)
+        profile_row.addWidget(self.profile_combo, 1)
+        self.profile_status_label = QLabel()
+        self.profile_status_label.setMinimumWidth(90)
+        profile_row.addWidget(self.profile_status_label)
+        outer.addLayout(profile_row)
+
+        target_box = QGroupBox("目标窗口")
+        target_row = QHBoxLayout(target_box)
+        target_row.addWidget(self.target_combo, 1)
+        target_row.addWidget(self.refresh_button)
+        outer.addWidget(target_box)
+        self.target_summary_label = QLabel("每次启动都需要重新确认窗口。")
+        self.target_summary_label.setWordWrap(True)
+        outer.addWidget(self.target_summary_label)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("运行模式"))
+        self.mode_combo.setItemText(0, "仅提醒")
+        self.mode_combo.setItemText(1, "自动确认")
+        mode_row.addWidget(self.mode_combo)
+        self.allow_activation_checkbox = QCheckBox("发现按钮后允许切回游戏")
+        self.allow_activation_checkbox.setToolTip(
+            "可能打断当前操作；系统拒绝切换时只提醒。仅授权当前一轮。"
+        )
+        self.allow_activation_checkbox.setChecked(False)
+        self.allow_activation_checkbox.toggled.connect(self._allow_activation_changed)
+        mode_row.addWidget(self.allow_activation_checkbox, 1)
+        outer.addLayout(mode_row)
+
+        outer.addWidget(self.state_label)
+        outer.addWidget(self.status_label)
+
+        self.start_button.setText("开始等待")
+        self.start_button.clicked.disconnect()
+        self.start_button.clicked.connect(self._primary_action)
+        self.pause_button.setText("暂停")
+        self.pause_button.clicked.disconnect()
+        self.pause_button.clicked.connect(self._toggle_pause_round)
+        self.resume_button.hide()
+        controls = QHBoxLayout()
+        controls.addWidget(self.start_button, 2)
+        controls.addWidget(self.pause_button)
+        controls.addWidget(self.resume_button)
+        controls.addWidget(self.stop_button)
+
+        utility = QHBoxLayout()
+        self.onboarding_button = QPushButton("开始设置")
+        self.onboarding_button.clicked.connect(self.open_onboarding)
+        self.preview_button.setText("无点击检查")
+        self.advanced_button = QPushButton("高级设置与诊断…")
+        self.advanced_button.clicked.connect(self.show_advanced)
+        self.hide_to_tray_button = QPushButton("隐藏到托盘")
+        self.hide_to_tray_button.clicked.connect(self.hide_to_tray)
+        utility.addWidget(self.onboarding_button)
+        utility.addWidget(self.preview_button)
+        utility.addWidget(self.advanced_button)
+        utility.addWidget(self.hide_to_tray_button)
+        outer.addLayout(utility)
+
+        self.hotkey_summary_label = QLabel("全局停止键：正在注册…")
+        outer.addWidget(self.hotkey_summary_label)
+        self.capture_release_error_label = QLabel()
+        self.capture_release_error_label.setWordWrap(True)
+        self.capture_release_error_label.hide()
+        outer.addWidget(self.capture_release_error_label)
+        outer.addStretch(1)
+        scroll.setWidget(content)
+        root_layout.addWidget(scroll, 1)
+        root_layout.addLayout(controls)
+        self.setCentralWidget(dashboard)
+
+        self.advanced_dialog = QDialog(self)
+        self.advanced_dialog.setWindowTitle("高级设置与诊断")
+        self.advanced_dialog.resize(900, 720)
+        dialog_layout = QVBoxLayout(self.advanced_dialog)
+        scroll = QScrollArea(self.advanced_dialog)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(advanced_content)
+        dialog_layout.addWidget(scroll)
+        self._create_tray()
+        self._saved_config_signature = self._config_signature()
+
+    def _primary_action(self) -> None:
+        if self.engine.snapshot().state == State.PAUSED and self._manual_pause_requested:
+            self.resume_round()
+            return
+        self.start_round()
+
+    def show_advanced(self) -> None:
+        self.advanced_dialog.show()
+        self.advanced_dialog.raise_()
+        self.advanced_dialog.activateWindow()
+
+    def _create_tray(self) -> None:
+        icon = QSystemTrayIcon(self)
+        icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        menu = QMenu(self)
+        restore = QAction("显示主界面", menu)
+        restore.triggered.connect(self.restore_from_tray)
+        hide = QAction("隐藏主界面", menu)
+        hide.triggered.connect(self.hide_to_tray)
+        self._tray_status_action = QAction("状态：尚未开始", menu)
+        self._tray_status_action.setEnabled(False)
+        stop = QAction("停止本轮", menu)
+        stop.triggered.connect(self.stop_round)
+        exit_action = QAction("退出", menu)
+        exit_action.triggered.connect(self._tray_exit)
+        menu.addAction(restore)
+        menu.addAction(hide)
+        menu.addAction(self._tray_status_action)
+        menu.addSeparator()
+        menu.addAction(stop)
+        menu.addAction(exit_action)
+        icon.setContextMenu(menu)
+        icon.activated.connect(self._tray_activated)
+        icon.messageClicked.connect(self.restore_from_tray)
+        self._tray_icon = icon
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            icon.setVisible(True)
+
+    def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in {
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        }:
+            self.restore_from_tray()
+
+    def hide_to_tray(self) -> None:
+        if self._tray_icon is None or not QSystemTrayIcon.isSystemTrayAvailable():
+            self.status_label.setText("系统托盘不可用，主界面保持打开。")
+            return
+        self.hide()
+        self._tray_icon.showMessage("Auto Ready", "已隐藏到托盘；本轮状态保持不变。")
+
+    def restore_from_tray(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _tray_exit(self) -> None:
+        self.stop_round()
+        self.close()
+
+    def _emit_notification(self, message: str = "发现按钮") -> None:
+        snapshot = self.engine.snapshot()
+        revision, authorization_epoch = self.worker.notification_context()
+        self.notificationRequested.emit(
+            message, snapshot.session_id, snapshot.state.value, revision, authorization_epoch
+        )
+
+    def _show_notification(
+        self,
+        message: str,
+        session_id: str,
+        state_value: str,
+        revision: int,
+        authorization_epoch: int,
+    ) -> None:
+        current_revision, current_epoch = self.worker.notification_context()
+        snapshot = self.engine.snapshot()
+        if (self._closed or self._shutdown_started
+                or revision != current_revision or authorization_epoch != current_epoch
+                or snapshot.session_id != session_id or snapshot.state.value != state_value):
+            return
+        if self.settings.sound_enabled or message == "测试提示音":
+            try:
+                self._sound_notifier()
+            except Exception:
+                pass
+        if self._tray_icon is not None and self._tray_icon.isVisible():
+            self._tray_icon.showMessage(
+                "Auto Ready", message, QSystemTrayIcon.MessageIcon.Information, 5000
+            )
+
+    def _config_signature(self) -> tuple[Any, ...]:
+        import hashlib
+
+        def template_signature(template: Template | None) -> Any:
+            if template is None:
+                return None
+            return (
+                template.reference_size,
+                template.dpi,
+                template.name,
+                hashlib.sha256(template.image.tobytes()).digest(),
+            )
+
+        return (
+            self.settings,
+            self.region,
+            template_signature(self.button),
+            template_signature(self.success),
+        )
+
+    def _update_dirty_state(self) -> None:
+        dirty = self._saved_config_signature is not None and (
+            self._config_signature() != self._saved_config_signature
+        )
+        if hasattr(self, "profile_status_label"):
+            self.profile_status_label.setText("未保存修改" if dirty else "已保存")
+        if hasattr(self, "current_config_label"):
+            text = self.current_config_label.text().split(" · 未保存修改")[0]
+            self.current_config_label.setText(text + (" · 未保存修改" if dirty else ""))
+        return None
+
+    def _profile_roots(self) -> tuple[Path, ...]:
+        roots = [getattr(self.store, "root", None)]
+        if self._current_config_path is not None:
+            roots.append(self._current_config_path.parent)
+        return tuple(Path(root) for root in roots if root is not None)
+
+    def _profile_combo_index(self, path: Path | None) -> int:
+        if path is None:
+            return self.profile_combo.findData(None)
+        expected = Path(path).resolve()
+        for index in range(self.profile_combo.count()):
+            candidate = self.profile_combo.itemData(index)
+            if candidate is not None and Path(candidate).resolve() == expected:
+                return index
+        return -1
+
+    def _refresh_profiles(self) -> None:
+        self._queue("list_profiles", self._profile_roots())
+
+    def _profile_combo_changed(self, index: int) -> None:
+        if index < 0 or not hasattr(self, "profile_combo"):
+            return
+        selected = self.profile_combo.itemData(index)
+        path = Path(selected) if selected is not None else None
+        default_path = getattr(self.store, "config_path", None)
+        is_current_default = path is None and self._current_config_path == default_path
+        if is_current_default or path == self._current_config_path:
+            return
+        self._request_profile_switch(path)
+
+    def _ask_about_dirty_edits(self) -> str:
+        self._update_dirty_state()
+        dirty = self._saved_config_signature is not None and (
+            self._config_signature() != self._saved_config_signature
+        )
+        if not dirty:
+            return "discard"
+        answer = QMessageBox.question(
+            self,
+            "未保存的修改",
+            "当前配置有未保存修改。先保存、放弃修改，还是取消切换？",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Save:
+            return "save"
+        if answer == QMessageBox.StandardButton.Discard:
+            return "discard"
+        return "cancel"
+
+    def _restore_profile_combo(self) -> None:
+        if not hasattr(self, "profile_combo"):
+            return
+        path = self._current_config_path
+        index = self._profile_combo_index(path)
+        default_path = getattr(self.store, "config_path", None)
+        if (index < 0 and path is not None and default_path is not None
+                and Path(path).resolve() == Path(default_path).resolve()):
+            index = self.profile_combo.findData(None)
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.setCurrentIndex(max(0, index))
+        self.profile_combo.blockSignals(False)
+
+    def _request_profile_switch(self, path: Path | None) -> None:
+        if self._profile_action_in_progress() or self._import_action_in_progress():
+            self._restore_profile_combo()
+            return
+        choice = self._ask_about_dirty_edits()
+        if choice == "cancel":
+            self._restore_profile_combo()
+            return
+        if choice == "save":
+            self._pending_profile_switch = path
+            self.save_config()
+            if self._pending_profile_request is None:
+                self._pending_profile_switch = None
+                self._restore_profile_combo()
+            return
+        self._queue_config_load(path)
+
+    def _load_existing_from_wizard(self) -> None:
+        self.choose_config_to_load()
+
+    def open_onboarding(self) -> None:
+        from .onboarding import OnboardingDraft, OnboardingWizard
+
+        if self._wizard is not None and self._wizard.isVisible():
+            self._wizard.raise_()
+            self._wizard.activateWindow()
+            return
+        self._stop_before_profile_dialog("首次设置向导")
+        draft = OnboardingDraft(
+            self.identity,
+            self.geometry,
+            self.settings,
+            self.region,
+            self.button,
+            self.success,
+            original_region=self.region,
+            original_button=self.button,
+            original_success=self.success,
+        )
+        self._wizard = OnboardingWizard(draft, self)
+        self._wizard.setModal(True)
+        self._wizard.targetsRequested.connect(self._wizard_refresh_targets)
+        self._wizard.targetChanged.connect(self._wizard_target_changed)
+        self._wizard.draftChanged.connect(self._wizard_draft_changed)
+        self._wizard.captureRequested.connect(self._wizard_capture)
+        self._wizard.recognitionRequested.connect(self._wizard_recognize)
+        self._wizard.finishRequested.connect(self._wizard_finish)
+        self._wizard.loadProfileRequested.connect(self._load_existing_from_wizard)
+        self._wizard.rejected.connect(self._wizard_cancelled)
+        self._wizard.show()
+        self._wizard_refresh_targets()
+
+    def _wizard_cancelled(self) -> None:
+        self._wizard = None
+        self._wizard_request = None
+        self._wizard_action = None
+        self._wizard_pending_identity = None
+        self._update_controls()
+
+    def _queue_wizard(self, action: str, payload: Any, label: str) -> None:
+        if self._wizard_request is not None:
+            return
+        request_id = self.worker.submit(action, payload)
+        if request_id is None:
+            if self._wizard is not None:
+                message = "后台任务繁忙，请稍后重试。"
+                if action == "wizard_save":
+                    self._wizard.save_failed(message)
+                elif action == "wizard_recognize":
+                    self._wizard.check_button.setEnabled(True)
+                    self._wizard.recognition_feedback.setText(message)
+                else:
+                    self._wizard.capture_failed(message)
+            return
+        self._wizard_request = request_id
+        self._wizard_action = action
+        self.status_label.setText(label)
+
+    def _wizard_refresh_targets(self) -> None:
+        self._queue_wizard("wizard_targets", int(self.winId()), "正在查找可用窗口…")
+
+    def _wizard_target_changed(self, identity: Any) -> None:
+        if identity is None:
+            return
+        self._wizard_revision += 1
+        self._wizard_pending_identity = identity
+        self._queue_pending_wizard_inspect()
+
+    def _queue_pending_wizard_inspect(self) -> None:
+        if (self._wizard is None or self._wizard_request is not None
+                or self._wizard_pending_identity is None):
+            return
+        identity = self._wizard_pending_identity
+        self._wizard_pending_identity = None
+        if identity == self._wizard.draft.identity:
+            self._queue_wizard("wizard_inspect", identity, "正在检查所选窗口…")
+
+    def _wizard_draft_changed(self) -> None:
+        self._wizard_revision += 1
+
+    def _capture_delay_for(self, *, wizard: bool = False) -> float | None:
+        explicit_wgc = self.settings.capture_method == "wgc"
+        explicit_front = self.settings.capture_method == "gdi"
+        known_front = self._capture_backend_name.casefold() in {"gdi", "foreground", "front"}
+        delay = self._capture_delay if explicit_front or known_front else 0.0
+        if not explicit_wgc and (explicit_front or known_front):
+            message = (
+                "当前使用前台兼容捕获。请切回游戏，确认画面静止后开始倒计时采图。"
+                if wizard else "当前使用前台兼容捕获。请切回游戏后再开始倒计时采图。"
+            )
+            answer = QMessageBox.question(
+                self,
+                "需要前台兼容捕获",
+                message,
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Ok:
+                return None
+        return delay
+
+    def _wizard_capture(self, identity: Identity) -> None:
+        if self._wizard is None or identity != self._wizard.draft.identity:
+            return
+        delay = self._capture_delay_for(wizard=True)
+        if delay is None:
+            self._wizard.capture_failed("已取消采图；原有模板仍保留。")
+            return
+        backend = self._capture_backend_name
+        self._wizard.set_capture_guidance(backend, delay)
+        self._queue_wizard(
+            "wizard_capture", (identity, delay), "正在后台获取静态画面…"
+        )
+
+    def _wizard_recognize(self, draft: Any) -> None:
+        if self._wizard is None or draft is not self._wizard.draft:
+            return
+        self._queue_wizard(
+            "wizard_recognize",
+            (
+                draft.identity,
+                draft.button,
+                draft.region,
+                draft.settings,
+                self._semantic_revision,
+                self._wizard_revision,
+            ),
+            "正在获取新画面并运行生产识别…",
+        )
+
+    def _wizard_finish(self, draft: Any, name: str) -> None:
+        if self._wizard is None or draft is not self._wizard.draft:
+            return
+        safe_name = name.strip()
+        has_invalid_character = any(
+            ord(character) < 32 or character in '<>:"/\\|?*'
+            for character in safe_name
+        )
+        if not safe_name or Path(safe_name).name != safe_name or has_invalid_character:
+            self._wizard.save_failed("配置名称包含不支持的文件名字符。")
+            return
+        try:
+            draft.settings.validate()
+            draft.region.validate()
+            if draft.button is None:
+                raise ValueError("请先在画面中框出按钮模板。")
+            if draft.geometry is None or not draft.button.compatible(draft.geometry):
+                raise ValueError("按钮模板与所选窗口尺寸或 DPI 不匹配，请重新采图。")
+            if draft.success is not None and not draft.success.compatible(draft.geometry):
+                raise ValueError("成功标志与所选窗口尺寸或 DPI 不匹配。")
+        except (AttributeError, ValueError) as exc:
+            self._wizard.save_failed(f"草稿无效：{exc}")
+            return
+        path = Path(self.store.root) / f"{safe_name}.json"
+        self._wizard_save_path = path
+        self._queue_wizard(
+            "wizard_save",
+            (path, draft.settings, draft.region, draft.button, draft.success),
+            "正在保存向导草稿…",
+        )
+
+    def _commit_wizard_draft(self, path: Path | None) -> None:
+        if self._wizard is None:
+            return
+        wizard = self._wizard
+        draft = wizard.draft
+        self._invalidate_semantics()
+        self.engine.stop("首次设置已保存；本轮未开始")
+        self.settings = draft.settings
+        self.region = draft.region
+        self.button = draft.button
+        self.success = draft.success
+        self.identity = draft.identity
+        self.geometry = draft.geometry
+        self._static_frame = draft.frame
+        self.mode = Mode.REMIND
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.setCurrentIndex(0)
+        self.mode_combo.blockSignals(False)
+        self._apply_settings_widgets()
+        self._install_hotkey()
+        if self.identity is not None:
+            index = self.target_combo.findData(self.identity)
+            if index >= 0:
+                self.target_combo.blockSignals(True)
+                self.target_combo.setCurrentIndex(index)
+                self.target_combo.blockSignals(False)
+            self._update_target_info(self.geometry)
+            self.target_summary_label.setText(
+                f"当前目标：{self.identity.title or Path(self.identity.executable).name}。"
+                "配置文件不会保存窗口绑定。"
+            )
+        if self._static_frame is not None:
+            self.preview.set_frame(self._static_frame)
+        self._configure_engine("首次设置已保存；请手动开始等待")
+        default_path = getattr(self.store, "config_path", None)
+        self._set_current_config_path(
+            Path(path) if path is not None else Path(default_path) if default_path else None
+        )
+        self._saved_config_signature = self._config_signature()
+        self._wizard_save_path = None
+        wizard.save_succeeded(path)
+        self._wizard = None
+        self._wizard_pending_identity = None
+        self.status_label.setText(
+            "配置已保存；识别已确认。你需要手动开始本轮。"
+            if draft.confirmed
+            else "配置已保存，但识别尚未确认；本轮未开始。"
+        )
+        self._refresh_profiles()
+        self._update_dirty_state()
         self._update_controls()
 
     def _queue(self, action: str, payload: Any = None, label: str = "") -> int | None:
@@ -597,13 +1264,27 @@ class MainWindow(QMainWindow):
         if path is None:
             self.current_config_label.setText("当前配置：默认配置")
             self.current_config_label.setToolTip("使用应用默认配置")
-            return
-        self.current_config_label.setText(f"当前配置：{path.name}")
-        self.current_config_label.setToolTip(str(path))
+        else:
+            self.current_config_label.setText(f"当前配置：{path.name}")
+            self.current_config_label.setToolTip(str(path))
+        if hasattr(self, "profile_combo"):
+            default_path = getattr(self.store, "config_path", None)
+            if (path is None or (default_path is not None
+                    and Path(path).resolve() == Path(default_path).resolve())):
+                index = self.profile_combo.findData(None)
+            else:
+                index = self._profile_combo_index(path)
+                if index < 0:
+                    self.profile_combo.addItem(path.stem, path)
+                    index = self.profile_combo.count() - 1
+            self.profile_combo.blockSignals(True)
+            self.profile_combo.setCurrentIndex(max(0, index))
+            self.profile_combo.blockSignals(False)
 
     def _set_current_config_path(self, path: Path | None) -> None:
         self._current_config_path = Path(path) if path is not None else None
         self._update_current_config_label()
+        self._update_dirty_state()
 
     def _profile_action_in_progress(self) -> bool:
         if self._pending_profile_request is None:
@@ -622,6 +1303,9 @@ class MainWindow(QMainWindow):
         if request_id is None:
             if action == "load_config":
                 self._config_loading = False
+            if self._pending_profile_switch is not None:
+                self._pending_profile_switch = None
+                self._restore_profile_combo()
             self._update_controls()
             return
         self._pending_profile_request = request_id
@@ -638,6 +1322,10 @@ class MainWindow(QMainWindow):
         self.worker.set_semantic_revision(self._semantic_revision)
         self._pending_start_request = None
         self._manual_pause_requested = False
+        if hasattr(self, "allow_activation_checkbox"):
+            self.allow_activation_checkbox.blockSignals(True)
+            self.allow_activation_checkbox.setChecked(False)
+            self.allow_activation_checkbox.blockSignals(False)
 
     def refresh_targets(self) -> None:
         self._refreshing_targets = True
@@ -668,6 +1356,7 @@ class MainWindow(QMainWindow):
         self.selection_combo.setCurrentIndex(0)
         if self.identity is None:
             self.target_info.setText("未选择目标；配置文件不会保存窗口绑定。")
+            self.target_summary_label.setText("每次启动都需要重新确认窗口。")
             if self_target:
                 self.status_label.setText("不能选择 Auto Ready 自身窗口作为目标。")
             self._update_controls()
@@ -675,6 +1364,10 @@ class MainWindow(QMainWindow):
         self.target_info.setText(
             f"{self.identity.title or '（无标题）'} · {self.identity.executable} · "
             f"PID {self.identity.pid} · HWND {self.identity.hwnd} · 正在检查客户区…"
+        )
+        self.target_summary_label.setText(
+            f"当前目标：{self.identity.title or Path(self.identity.executable).name}。"
+            "配置文件不会保存窗口绑定。"
         )
         self._queue("inspect", self.identity, "正在检查窗口客户区…")
         self._update_controls()
@@ -697,16 +1390,15 @@ class MainWindow(QMainWindow):
         if snapshot.frame is not None:
             self._last_displayed_key = (snapshot.frame.session_id, snapshot.frame.sequence)
         self.engine.stop("重新采集截图")
-        if clear_selections:
-            self.button = None
-            self.success = None
-            self.region = Region()
-        self._static_frame = None
-        self.selection_combo.setCurrentIndex(0)
-        self.preview.set_frame(None)
-        request_id = self._queue("capture", (self.identity, self._capture_delay),
-                                 "正在等待后采集静态截图…")
+        delay = self._capture_delay_for()
+        if delay is None:
+            return
+        self._capture_clears_selections = clear_selections
+        request_id = self._queue("capture", (self.identity, delay),
+                                 "正在获取静态截图；原有模板仍保留…")
         self._pending_capture_request = request_id
+        if request_id is None:
+            self._capture_clears_selections = False
         self._update_controls()
 
     def _selection_mode_changed(self, index: int) -> None:
@@ -749,6 +1441,7 @@ class MainWindow(QMainWindow):
                 return
             self.preview.set_frame(frame)
             self.status_label.setText(self._template_summary())
+            self._update_dirty_state()
             self._update_controls()
         except (ValueError, IndexError) as exc:
             if selection_kind == "button":
@@ -780,6 +1473,7 @@ class MainWindow(QMainWindow):
             return False
 
     def _settings_changed(self, *_args: Any) -> None:
+        previous_capture_method = self.settings.capture_method
         self._invalidate_semantics()
         self.engine.stop("参数或停止键已更改，当前轮已取消")
         self.settings = replace(
@@ -789,9 +1483,17 @@ class MainWindow(QMainWindow):
             stable_seconds=self.stable_spin.value(),
             round_timeout=self.timeout_spin.value(),
             hotkey=self.hotkey_combo.currentText(),
+            capture_method=str(self.capture_method_combo.currentData() or "auto"),
+            sound_enabled=self.sound_enabled_checkbox.isChecked(),
         )
+        if self.settings.capture_method != previous_capture_method:
+            self._static_frame = None
+            self.preview.set_frame(None)
+            self._queue("set_capture_method", self.settings.capture_method,
+                        "正在切换捕获方式；旧画面与候选已作废…")
         self._install_hotkey()
         self._configure_engine("参数或停止键已更改，当前轮已取消")
+        self._update_dirty_state()
 
     def _mode_changed(self, index: int) -> None:
         mode = self.mode_combo.itemData(index)
@@ -801,6 +1503,14 @@ class MainWindow(QMainWindow):
         self.mode = Mode(mode)
         self._configure_engine("运行模式已更改，当前轮已取消")
         self.status_label.setText(f"模式：{self.mode.value}；当前轮已取消，请手动预览或开始。")
+        self._update_controls()
+
+    def _allow_activation_changed(self, checked: bool) -> None:
+        if self.mode != Mode.AUTO and checked:
+            self.allow_activation_checkbox.blockSignals(True)
+            self.allow_activation_checkbox.setChecked(False)
+            self.allow_activation_checkbox.blockSignals(False)
+        self._update_controls()
 
     def _install_hotkey(self) -> None:
         if self._hotkey is not None:
@@ -878,13 +1588,22 @@ class MainWindow(QMainWindow):
             return
         if self._pending_start_request is not None:
             return
-        request_id = self.worker.submit("start", self._semantic_revision)
+        allow_activation = bool(
+            self.mode == Mode.AUTO and self.allow_activation_checkbox.isChecked()
+        )
+        request_id = self.worker.submit(
+            "start", (self._semantic_revision, allow_activation)
+        )
         if request_id is None:
             self.status_label.setText("后台任务繁忙，未能开始本轮，请稍后重试。")
             return
         self._pending_start_request = request_id
         self._manual_pause_requested = False
-        self.status_label.setText("正在后台检查目标并启用本轮…")
+        self._allow_activation_round = allow_activation
+        self.allow_activation_checkbox.blockSignals(True)
+        self.allow_activation_checkbox.setChecked(False)
+        self.allow_activation_checkbox.blockSignals(False)
+        self.status_label.setText("正在检查目标并开始本轮等待…")
         self._update_controls()
 
     def pause_round(self) -> None:
@@ -895,7 +1614,8 @@ class MainWindow(QMainWindow):
             self._update_controls()
             return
         if self.engine.snapshot().state not in {
-            State.MONITORING, State.CONFIRMING, State.ATTEMPTED, State.VERIFYING, State.PAUSED
+            State.MONITORING, State.CONFIRMING, State.ATTEMPTED, State.VERIFYING, State.PAUSED,
+            State.BACKGROUND, State.WAITING_FOREGROUND, State.ACTIVATING, State.REMINDED,
         }:
             return
         self.worker.invalidate_authorization()
@@ -913,6 +1633,15 @@ class MainWindow(QMainWindow):
     def stop_round(self) -> None:
         self._invalidate_semantics()
         self.engine.stop("已手动停止")
+        self._allow_activation_round = False
+        self.status_label.setText("本轮已停止。")
+        self._update_controls()
+
+    def _toggle_pause_round(self) -> None:
+        if self.engine.snapshot().state == State.PAUSED and self._manual_pause_requested:
+            self.resume_round()
+        else:
+            self.pause_round()
 
     def save_config(self) -> None:
         if self._profile_action_in_progress():
@@ -974,7 +1703,7 @@ class MainWindow(QMainWindow):
         if not path:
             self.status_label.setText("已取消载入配置选择；本轮保持停止。")
             return
-        self._queue_config_load(Path(path))
+        self._request_profile_switch(Path(path))
 
     def load_config(self, path: Path | None = None) -> None:
         """Load the default configuration or an explicitly selected profile."""
@@ -983,9 +1712,10 @@ class MainWindow(QMainWindow):
         if self._import_action_in_progress():
             return
         self._stop_before_profile_dialog("载入配置")
-        self._queue_config_load(path)
+        self._request_profile_switch(Path(path) if path is not None else None)
 
     def _queue_config_load(self, path: Path | None) -> None:
+        self._stop_before_profile_dialog("载入配置")
         self._config_loading = True
         self._update_controls()
         self._queue_profile_action(
@@ -1034,6 +1764,13 @@ class MainWindow(QMainWindow):
         self.hotkey_combo.blockSignals(True)
         self.hotkey_combo.setCurrentText(self.settings.hotkey)
         self.hotkey_combo.blockSignals(False)
+        self.capture_method_combo.blockSignals(True)
+        capture_index = self.capture_method_combo.findData(self.settings.capture_method)
+        self.capture_method_combo.setCurrentIndex(max(0, capture_index))
+        self.capture_method_combo.blockSignals(False)
+        self.sound_enabled_checkbox.blockSignals(True)
+        self.sound_enabled_checkbox.setChecked(self.settings.sound_enabled)
+        self.sound_enabled_checkbox.blockSignals(False)
         for widget in widgets:
             widget.blockSignals(False)
 
@@ -1059,6 +1796,8 @@ class MainWindow(QMainWindow):
             )
         else:
             self._set_current_config_path(path)
+        self._saved_config_signature = self._config_signature()
+        self._update_dirty_state()
         self.status_label.setText("配置已载入；本轮未启用，请检查模板后手动预览并开始。")
         self._update_controls()
 
@@ -1070,13 +1809,43 @@ class MainWindow(QMainWindow):
                 action = self._pending_profile_action
                 self._pending_profile_request = None
                 self._pending_profile_action = None
+                self._pending_profile_switch = None
                 if action == "load_config":
                     self._config_loading = False
                 self.status_label.setText(f"后台操作失败：{result.error}")
+                self._restore_profile_combo()
                 self._update_controls()
+                return
+            if result.action.startswith("wizard_"):
+                if result.request_id != self._wizard_request:
+                    return
+                action = self._wizard_action
+                self._wizard_request = None
+                self._wizard_action = None
+                if self._wizard is not None:
+                    if action == "wizard_save":
+                        self._wizard_save_path = None
+                        self._wizard.save_failed(result.error)
+                    elif action == "wizard_capture":
+                        self._wizard.capture_failed(result.error)
+                    elif action == "wizard_recognize":
+                        self._wizard.check_button.setEnabled(True)
+                        self._wizard.recognition_feedback.setText(
+                            f"检查失败：{result.error}。可以调整后重试或保存为未确认配置。"
+                        )
+                    elif action == "wizard_inspect":
+                        self._wizard.target_feedback.setText(
+                            f"无法检查所选窗口：{result.error}"
+                        )
+                    else:
+                        self._wizard.target_feedback.setText(
+                            f"无法读取窗口列表：{result.error}"
+                        )
+                self._queue_pending_wizard_inspect()
                 return
             if result.action == "capture" and result.request_id == self._pending_capture_request:
                 self._pending_capture_request = None
+                self._capture_clears_selections = False
                 self._update_controls()
             if (result.action == "import_template"
                     and result.request_id == self._pending_import_request):
@@ -1085,6 +1854,9 @@ class MainWindow(QMainWindow):
             if result.action == "refresh_targets":
                 self._refreshing_targets = False
                 self._update_controls()
+            if result.action == "list_profiles":
+                self.status_label.setText(f"配置列表读取失败：{result.error}")
+                return
             if result.action == "start" and result.request_id == self._pending_start_request:
                 self._pending_start_request = None
                 self.status_label.setText(f"无法开始：{result.error}")
@@ -1094,7 +1866,76 @@ class MainWindow(QMainWindow):
                 self.status_label.setText(f"后台操作失败：{result.error}")
             return
         value = result.value
-        if result.action == "refresh_targets":
+        if result.action == "list_profiles":
+            self.profile_combo.blockSignals(True)
+            self.profile_combo.clear()
+            self.profile_combo.addItem("默认配置", None)
+            default_path = getattr(self.store, "config_path", None)
+            for path, stem in value:
+                path = Path(path)
+                if default_path is not None and path == Path(default_path).resolve():
+                    continue
+                self.profile_combo.addItem(stem, path)
+            current = self._current_config_path
+            if (current is None or (default_path is not None
+                    and Path(current).resolve() == Path(default_path).resolve())):
+                index = self.profile_combo.findData(None)
+            else:
+                index = self._profile_combo_index(current)
+                if index < 0:
+                    self.profile_combo.addItem(current.stem, current)
+                    index = self.profile_combo.count() - 1
+            self.profile_combo.setCurrentIndex(max(0, index))
+            self.profile_combo.blockSignals(False)
+        elif result.action == "wizard_targets":
+            if self._wizard is None or result.request_id != self._wizard_request:
+                return
+            self._wizard_request = None
+            self._wizard_action = None
+            self._wizard.set_targets(value)
+            self._queue_pending_wizard_inspect()
+        elif result.action == "wizard_inspect":
+            if self._wizard is None or result.request_id != self._wizard_request:
+                return
+            self._wizard_request = None
+            self._wizard_action = None
+            identity, geometry = value
+            if identity == self._wizard.draft.identity:
+                self._wizard.set_target_geometry(identity, geometry)
+            elif self._wizard.draft.identity is not None:
+                self._wizard_pending_identity = self._wizard.draft.identity
+            self._queue_pending_wizard_inspect()
+        elif result.action == "wizard_capture":
+            if self._wizard is None or result.request_id != self._wizard_request:
+                return
+            self._wizard_request = None
+            self._wizard_action = None
+            identity, frame, geometry = value
+            if identity == self._wizard.draft.identity and frame.identity == identity:
+                self._wizard.set_target_geometry(identity, geometry)
+                self._wizard.set_frame(frame)
+            elif self._wizard.draft.identity is not None:
+                self._wizard_pending_identity = self._wizard.draft.identity
+            self._queue_pending_wizard_inspect()
+        elif result.action == "wizard_recognize":
+            if self._wizard is None or result.request_id != self._wizard_request:
+                return
+            self._wizard_request = None
+            self._wizard_action = None
+            identity, draft_revision, detection = value
+            if (identity == self._wizard.draft.identity
+                    and draft_revision == self._wizard_revision):
+                self._wizard.recognition_completed(detection)
+            elif self._wizard.draft.identity is not None:
+                self._wizard_pending_identity = self._wizard.draft.identity
+            self._queue_pending_wizard_inspect()
+        elif result.action == "wizard_save":
+            if self._wizard is None or result.request_id != self._wizard_request:
+                return
+            self._wizard_request = None
+            self._wizard_action = None
+            self._commit_wizard_draft(Path(value) if value is not None else None)
+        elif result.action == "refresh_targets":
             self._refreshing_targets = False
             current = self.identity
             self.target_combo.blockSignals(True)
@@ -1102,9 +1943,11 @@ class MainWindow(QMainWindow):
             self.target_combo.addItem("请选择目标窗口", None)
             own_hwnd = int(self.winId())
             available = [identity for identity in value if identity.hwnd != own_hwnd]
-            for identity in available:
-                label = (f"{identity.title or '（无标题）'} — {identity.executable} "
-                         f"[PID {identity.pid}]")
+            for number, identity in enumerate(available, start=1):
+                label = (
+                    f"窗口 {number} · {identity.title or '（无标题）'} · "
+                    f"{Path(identity.executable).name}"
+                )
                 self.target_combo.addItem(label, identity)
             self.target_combo.setCurrentIndex(0)
             self.target_combo.blockSignals(False)
@@ -1141,8 +1984,14 @@ class MainWindow(QMainWindow):
             self._pending_capture_request = None
             frame, geometry = value
             if frame.identity != self.identity:
+                self._capture_clears_selections = False
                 return
             previous = self.geometry
+            if self._capture_clears_selections:
+                self.button = None
+                self.success = None
+                self.region = Region()
+            self._capture_clears_selections = False
             if previous is not None and previous.template_key != geometry.template_key:
                 self.region = Region()
             if self.button is not None and not self.button.compatible(geometry):
@@ -1154,6 +2003,7 @@ class MainWindow(QMainWindow):
             self.preview.set_frame(frame)
             self._update_target_info(geometry)
             self.status_label.setText("截图仅保存在内存；请选择按钮模板、搜索区域或成功标志进行框选。")
+            self._update_dirty_state()
             self._update_controls()
         elif result.action == "preview":
             if value is None:
@@ -1169,8 +2019,11 @@ class MainWindow(QMainWindow):
             if result.request_id != self._pending_start_request:
                 return
             self._pending_start_request = None
-            _revision, session_id = value
+            _revision, session_id, allow_activation = value
+            self._allow_activation_round = bool(allow_activation)
             mode_text = "仅提醒，不会点击" if self.mode == Mode.REMIND else "自动确认已由你手动开始"
+            if allow_activation:
+                mode_text += "，本轮允许请求切回"
             self.status_label.setText(f"本轮已手动开始（{session_id}）；{mode_text}。")
             self._update_controls()
         elif result.action in {"save_config", "save_config_as", "load_config"}:
@@ -1191,18 +2044,38 @@ class MainWindow(QMainWindow):
                 path, revision = value
                 if revision == self._semantic_revision:
                     self._set_current_config_path(path)
+                    self._saved_config_signature = self._config_signature()
+                    self._update_dirty_state()
                     self.status_label.setText("配置和模板已另存；本轮保持停止。")
+                    self._refresh_profiles()
+                    if self._pending_profile_switch is not None:
+                        switch_path = self._pending_profile_switch
+                        self._pending_profile_switch = None
+                        self._queue_config_load(switch_path)
                 else:
                     self.status_label.setText(
                         "已保存选择时的配置快照；设置随后已更改，当前配置位置未切换。"
                     )
+                    if self._pending_profile_switch is not None:
+                        self._pending_profile_switch = None
+                        self._restore_profile_combo()
                 self._update_controls()
             else:
                 _path, revision = value
                 if revision == self._semantic_revision:
+                    self._saved_config_signature = self._config_signature()
+                    self._update_dirty_state()
                     self.status_label.setText("当前配置和模板已保存。")
+                    self._refresh_profiles()
+                    if self._pending_profile_switch is not None:
+                        switch_path = self._pending_profile_switch
+                        self._pending_profile_switch = None
+                        self._queue_config_load(switch_path)
                 else:
                     self.status_label.setText("已保存配置快照；设置随后已更改。")
+                    if self._pending_profile_switch is not None:
+                        self._pending_profile_switch = None
+                        self._restore_profile_combo()
                 self._update_controls()
         elif result.action == "import_template":
             if result.request_id != self._pending_import_request:
@@ -1260,8 +2133,13 @@ class MainWindow(QMainWindow):
             else:
                 self.hotkey_status_label.setText(f"已注册：{self.settings.hotkey}")
             self._update_controls()
+        self.hotkey_summary_label.setText(
+            f"全局停止键：{'已注册' if self._hotkey_available else '不可用'}"
+            f"（{self.settings.hotkey}）"
+        )
         snapshot = self.worker.latest_snapshot()
         if snapshot is None:
+            self._show_capture_release_errors()
             return
         if snapshot.frame is not None:
             key = (snapshot.frame.session_id, snapshot.frame.sequence)
@@ -1281,7 +2159,32 @@ class MainWindow(QMainWindow):
         details = [f"状态：{snapshot.state.value}", f"原因：{snapshot.reason}",
                    f"轮次：{snapshot.session_id or '无'}",
                    f"{elapsed_label}：{snapshot.elapsed:.1f} 秒"]
-        self.state_label.setText(f"{snapshot.state.value} · {snapshot.reason}")
+        state_text = self._state_summary(snapshot)
+        self.state_label.setText(state_text)
+        status_key = (snapshot.state, snapshot.reason)
+        if status_key != self._last_dashboard_status:
+            self.status_label.setText(self._reason_and_next_step(snapshot))
+            self._last_dashboard_status = status_key
+        if snapshot.capture_status is not None:
+            capture = snapshot.capture_status
+            self._capture_backend_name = capture.backend
+            self.capture_status_label.setText(
+                f"捕获：{capture.backend}；支持={capture.supported}；"
+                f"当前画面有效={capture.valid_frame}；后台识别={capture.background_supported}；"
+                f"前台={capture.foreground}；遮挡={capture.obscured}；最小化={capture.minimized}；"
+                f"新帧={capture.fresh}。{capture.reason}"
+            )
+        elif snapshot.foreground is not None:
+            self._capture_backend_name = getattr(
+                snapshot.frame, "backend", self._capture_backend_name
+            )
+            self.capture_status_label.setText(
+                f"捕获：{self._capture_backend_name}；前台={snapshot.foreground}；"
+                "详细能力状态由当前目标检查结果提供。"
+            )
+        self._show_capture_release_errors()
+        if self._tray_status_action is not None:
+            self._tray_status_action.setText(f"状态：{state_text} · {snapshot.reason}")
         if snapshot.detection is not None:
             detection = snapshot.detection
             details.append(f"最高原始分数：{detection.best_score:.6f}")
@@ -1297,6 +2200,69 @@ class MainWindow(QMainWindow):
             details.append("尚无识别结果")
         self.candidates_text.setPlainText("\n".join(details))
         self._update_controls(snapshot.state)
+
+    def _show_capture_release_errors(self) -> None:
+        errors = self.worker.capture_release_errors()
+        if errors:
+            message = "捕获资源释放失败（保留错误记录）：" + "；".join(errors)
+            self.capture_status_label.setText(message)
+            self.capture_release_error_label.setText(message)
+            self.capture_release_error_label.show()
+
+    def _state_summary(self, snapshot: Snapshot) -> str:
+        state = snapshot.state
+        if state == State.DISARMED:
+            if self.identity is None:
+                return "未配置目标；尚未开始"
+            if self.button is None:
+                return "配置未完成；尚未开始"
+            return "已就绪；尚未开始"
+        if state == State.MONITORING:
+            return "正在前台等待"
+        if state == State.BACKGROUND:
+            return "正在后台等待"
+        if state == State.WAITING_FOREGROUND:
+            return "已发现按钮，等待你切回"
+        if state == State.ACTIVATING:
+            return "正在尝试切回"
+        if state == State.REMINDED:
+            return "已提醒"
+        if state == State.CONFIRMING:
+            return "正在确认按钮"
+        if state == State.ATTEMPTED:
+            return "已尝试点击，结果尚未确认"
+        if state == State.VERIFYING:
+            return "正在验证结果"
+        if state == State.SUCCESS:
+            return "已验证成功"
+        if state == State.UNCONFIRMED:
+            return "本轮结束；结果未确认"
+        if state == State.PAUSED:
+            return "已暂停"
+        if state == State.ERROR:
+            return "本轮失败并已停止"
+        return state.value
+
+    def _reason_and_next_step(self, snapshot: Snapshot) -> str:
+        next_step = {
+            State.DISARMED: (
+                "点击‘开始设置’或载入已有配置。"
+                if self.button is None else "准备完成；点击‘开始等待’后才会启动本轮。"
+            ),
+            State.MONITORING: "可以切换到其他窗口；当前捕获状态见高级诊断。",
+            State.BACKGROUND: "后台识别仍需当前目标提供有效新画面。",
+            State.WAITING_FOREGROUND: "请手动切回目标窗口，程序会重新识别。",
+            State.ACTIVATING: "系统可能拒绝切换；此时程序只会提醒。",
+            State.REMINDED: "请查看通知，并按需要手动处理。",
+            State.ATTEMPTED: "已点击不代表准备完成；等待成功证据。",
+            State.VERIFYING: "正在等待成功标志模板的证据。",
+            State.SUCCESS: "本轮已结束。",
+            State.UNCONFIRMED: "本轮已结束；没有足够证据确认结果。",
+            State.PAUSED: "点击‘继续’后恢复本轮。",
+            State.ERROR: "查看高级诊断，再决定是否重新开始。",
+        }.get(snapshot.state, "")
+        reason = snapshot.reason.strip()
+        return f"{reason} 下一步：{next_step}" if next_step else reason
 
     def _update_controls(self, state: State | None = None) -> None:
         if state is None:
@@ -1316,21 +2282,39 @@ class MainWindow(QMainWindow):
         self.capture_button.setEnabled(capture_allowed)
         self.recollect_button.setEnabled(capture_allowed)
         self.preview_button.setEnabled(ready)
-        self.start_button.setEnabled(ready and start_allowed and
-                                     self._pending_start_request is None and
-                                     state not in {State.MONITORING, State.CONFIRMING,
-                                                   State.ATTEMPTED, State.VERIFYING,
-                                                   State.PAUSED})
-        self.pause_button.setEnabled(self._pending_start_request is not None or
-                                     state in {State.MONITORING, State.CONFIRMING,
-                                               State.ATTEMPTED, State.VERIFYING,
-                                               State.PAUSED})
+        active_states = {
+            State.MONITORING, State.CONFIRMING, State.ATTEMPTED, State.VERIFYING,
+            State.BACKGROUND, State.WAITING_FOREGROUND, State.ACTIVATING,
+        }
+        paused = state == State.PAUSED and self._manual_pause_requested
+        active = state in active_states
+        self.start_button.setText("继续等待" if paused else "开始等待")
+        self.start_button.setEnabled(
+            (ready and start_allowed and self._pending_start_request is None
+             and not active) or paused
+        )
+        self.pause_button.setText("暂停")
+        self.pause_button.setVisible(not paused)
+        self.pause_button.setEnabled(
+            self._pending_start_request is not None or active or paused
+        )
         self.resume_button.setEnabled(
             self._manual_pause_requested and state == State.PAUSED
         )
-        self.stop_button.setEnabled(self._pending_start_request is not None or state not in {
-            None, State.DISARMED, State.SUCCESS, State.UNCONFIRMED, State.ERROR
-        })
+        self.stop_button.setEnabled(
+            active or paused or self._pending_start_request is not None
+        )
+        self.allow_activation_checkbox.setVisible(self.mode == Mode.AUTO)
+        self.allow_activation_checkbox.setEnabled(
+            self.mode == Mode.AUTO and not active and not paused
+            and self._pending_start_request is None
+        )
+        self.onboarding_button.setText(
+            "编辑配置" if self.button is not None else "开始设置"
+        )
+        self.onboarding_button.setEnabled(
+            self._pending_profile_request is None and self._pending_capture_request is None
+        )
         profile_available = (self._pending_profile_request is None
                              and self._pending_import_request is None)
         self.save_button.setEnabled(profile_available)
@@ -1382,6 +2366,8 @@ class MainWindow(QMainWindow):
 
     def _finish_close(self) -> None:
         self._closed = True
+        if self._tray_icon is not None:
+            self._tray_icon.setVisible(False)
         if self._shutdown_poll_timer is not None:
             self._shutdown_poll_timer.stop()
 
